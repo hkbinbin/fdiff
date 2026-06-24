@@ -32,6 +32,24 @@ pub struct FileRecord {
 
 pub struct ScanOptions {
     pub exclude: globset::GlobSet,
+    /// Lowercased path prefixes; any file whose lowercased path starts with
+    /// one of these is skipped. Paths are normalized to use backslashes and
+    /// have no trailing separator.
+    pub exclude_prefixes: Vec<String>,
+}
+
+impl ScanOptions {
+    /// Normalize a user-supplied path prefix for matching:
+    /// - lowercased (Windows is case-insensitive)
+    /// - forward slashes converted to backslashes
+    /// - trailing backslash trimmed
+    pub fn normalize_prefix(p: &str) -> String {
+        let mut s = p.replace('/', "\\").to_ascii_lowercase();
+        while s.ends_with('\\') {
+            s.pop();
+        }
+        s
+    }
 }
 
 pub fn scan_volume(
@@ -65,6 +83,21 @@ pub fn scan_volume(
         }
 
         let path_str = path_to_string(&info.path);
+
+        // 1) Path-prefix filter (cheap, case-insensitive).
+        if !opts.exclude_prefixes.is_empty() {
+            let lower = path_str.to_ascii_lowercase();
+            if opts
+                .exclude_prefixes
+                .iter()
+                .any(|p| starts_with_prefix(&lower, p))
+            {
+                skipped += 1;
+                continue;
+            }
+        }
+
+        // 2) Glob filter.
         if !opts.exclude.is_empty() && opts.exclude.is_match(&path_str) {
             skipped += 1;
             continue;
@@ -106,6 +139,19 @@ fn to_unix(t: Option<time::OffsetDateTime>) -> i64 {
 
 fn path_to_string(p: &PathBuf) -> String {
     p.to_string_lossy().to_string()
+}
+
+/// True when `path` (already lowercased) begins with `prefix` at a path-component
+/// boundary. Avoids spurious `C:\Foo` matching `C:\FooBar`.
+fn starts_with_prefix(path: &str, prefix: &str) -> bool {
+    if !path.starts_with(prefix) {
+        return false;
+    }
+    match path.as_bytes().get(prefix.len()) {
+        None => true,
+        Some(b'\\') | Some(b'/') => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

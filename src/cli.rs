@@ -39,11 +39,24 @@ pub struct ScanArgs {
     /// Friendly name for this snapshot, e.g. "before" / "after".
     pub name: String,
 
-    /// Only scan these volume labels (e.g. `--volumes C,D`). Defaults to all NTFS volumes.
+    /// Only scan these volume labels (whitelist, e.g. `--volumes C,D`).
+    /// Defaults to all NTFS volumes when neither --volumes nor --exclude-volumes is set.
     #[arg(long, value_delimiter = ',')]
     pub volumes: Vec<String>,
 
-    /// Glob pattern(s) to exclude (matched against full path). Can be specified multiple times.
+    /// Skip these volume labels (blacklist, e.g. `--exclude-volumes D,E`).
+    /// Applied after --volumes if both are present.
+    #[arg(long, value_delimiter = ',')]
+    pub exclude_volumes: Vec<String>,
+
+    /// Skip files whose path starts with this prefix (case-insensitive).
+    /// Repeatable. Example: `--exclude-path "C:\Windows\WinSxS"`.
+    /// Slashes and trailing backslashes are normalized for you.
+    #[arg(long, value_name = "PATH")]
+    pub exclude_path: Vec<String>,
+
+    /// Glob pattern(s) to exclude (matched against full path).
+    /// Repeatable. Example: `--exclude '**/$Recycle.Bin/**'`.
     #[arg(long)]
     pub exclude: Vec<String>,
 

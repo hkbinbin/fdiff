@@ -84,6 +84,19 @@ fn cmd_scan(db: Option<PathBuf>, a: ScanArgs) -> Result<()> {
                 .any(|w| lab == *w || lab.trim_end_matches(':') == *w)
         });
     }
+    if !a.exclude_volumes.is_empty() {
+        let banned: Vec<String> = a
+            .exclude_volumes
+            .iter()
+            .map(|v| v.trim().trim_end_matches('\\').trim_end_matches(':').to_uppercase())
+            .collect();
+        vols.retain(|v| {
+            let lab = v.label().to_uppercase();
+            !banned
+                .iter()
+                .any(|w| lab == *w || lab.trim_end_matches(':') == *w)
+        });
+    }
     if vols.is_empty() {
         anyhow::bail!("no matching NTFS volumes to scan");
     }
@@ -101,7 +114,23 @@ fn cmd_scan(db: Option<PathBuf>, a: ScanArgs) -> Result<()> {
         }
         b.build()?
     };
-    let opts = ScanOptions { exclude };
+    let exclude_prefixes: Vec<String> = a
+        .exclude_path
+        .iter()
+        .map(|p| ScanOptions::normalize_prefix(p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if !exclude_prefixes.is_empty() {
+        println!(
+            "Excluding {} path prefix(es): {}",
+            exclude_prefixes.len(),
+            exclude_prefixes.join(", ")
+        );
+    }
+    let opts = ScanOptions {
+        exclude,
+        exclude_prefixes,
+    };
 
     // Set up channel and writer thread.
     let (tx, rx) = bounded::<FileRecord>(200_000);

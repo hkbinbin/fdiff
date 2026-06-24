@@ -52,10 +52,15 @@ Renamed / **Replaced** PE — the original full path, volume, FRN, size, mtime,
 ```
 fdiff volumes                      # list NTFS volumes
 fdiff scan <name>                  # snapshot all NTFS volumes
-fdiff scan <name> --volumes C,D    # limit volumes
+fdiff scan <name> --volumes C,D    # whitelist volumes (only scan C and D)
+fdiff scan <name> --exclude-volumes D,E
+                                   # blacklist volumes (scan everything except D and E)
+fdiff scan <name> --exclude-path "C:\Windows\WinSxS" --exclude-path "C:\Users\me\Downloads"
+                                   # skip any file whose path starts with these prefixes (case-insensitive)
+fdiff scan <name> --exclude '**/$Recycle.Bin/**' --exclude '**/Windows/SoftwareDistribution/**'
+                                   # glob-based exclusion (matched against full path)
 fdiff scan <name> --no-hash        # skip SHA-256 stage (fastest)
 fdiff scan <name> --blake3         # also compute BLAKE3
-fdiff scan <name> --exclude '**/$Recycle.Bin/**' --exclude '**/Windows/WinSxS/**'
 fdiff list                         # list stored snapshots
 fdiff rm <name>                    # delete a snapshot
 fdiff diff <before> <after>        # console summary
@@ -63,6 +68,22 @@ fdiff diff <before> <after> --json # JSON for downstream scripts
 fdiff diff <before> <after> --dump out\
                                    # console + copy all changed PEs + manifest.json
 ```
+
+### Filtering cheatsheet
+
+* `--volumes C,D` — only scan these drive letters (whitelist).
+* `--exclude-volumes D,E` — never scan these drive letters (blacklist).
+  Applied after `--volumes`; the two compose naturally.
+* `--exclude-path "<prefix>"` — drop any file whose full path **starts with**
+  the given prefix. Forward slashes and trailing backslashes are normalized,
+  comparison is case-insensitive, and matching only happens at path-component
+  boundaries (so `--exclude-path C:\Foo` will not accidentally exclude
+  `C:\FooBar`). Repeatable.
+* `--exclude '<glob>'` — full-path glob exclusion. Use this when you need
+  wildcards (`**/$Recycle.Bin/**`).
+
+All three filters are applied during `scan` and the excluded files never
+enter the snapshot. To restore them later, re-scan without the filter.
 
 Default DB: `%LOCALAPPDATA%\fdiff\fdiff.db`. Override with `--db <path>`.
 
