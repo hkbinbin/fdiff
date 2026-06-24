@@ -1,0 +1,16 @@
+# Cargo build output
+/target/
+
+# Local SQLite snapshots / dumps a user might create while testing
+*.db
+*.db-wal
+*.db-shm
+/out/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

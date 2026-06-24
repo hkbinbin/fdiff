@@ -1,0 +1,44 @@
+[package]
+name = "fdiff"
+version = "0.1.0"
+edition = "2021"
+description = "Everything-style full-disk file snapshot and diff CLI for forensics (cheat / DLL hijack detection)"
+
+[[bin]]
+name = "fdiff"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ntfs-reader = "0.4"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.10"
+blake3 = { version = "1", features = ["rayon"] }
+rayon = "1"
+num_cpus = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+indicatif = "0.18"
+globset = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossbeam-channel = "0.5"
+time = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+[build-dependencies]
+embed-manifest = "1"
