@@ -8,6 +8,15 @@ Built in Rust. Reads `$MFT` directly through the [`ntfs-reader`](https://crates.
 
 ---
 
+## Download
+
+Pre-built Windows binaries are published on the
+[Releases page](https://github.com/hkbinbin/fdiff/releases) — grab the latest
+`fdiff-vX.Y.Z-x86_64-windows.zip` (or the raw `fdiff.exe` for a single-file
+install). Every asset is published alongside its SHA-256.
+
+---
+
 ## Build
 
 ```bash
