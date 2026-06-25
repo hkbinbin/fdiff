@@ -61,6 +61,8 @@ fdiff scan <name> --exclude '**/$Recycle.Bin/**' --exclude '**/Windows/SoftwareD
                                    # glob-based exclusion (matched against full path)
 fdiff scan <name> --no-hash        # skip SHA-256 stage (fastest)
 fdiff scan <name> --blake3         # also compute BLAKE3
+fdiff watch                        # NEW: real-time monitor (USN journal). Ctrl-C to stop
+fdiff watch --ext pe --dump live\  # only PE files; copy each to live\ with manifest
 fdiff list                         # list stored snapshots
 fdiff rm <name>                    # delete a snapshot
 fdiff diff <before> <after>        # console summary (skips directories by default)
@@ -104,6 +106,51 @@ fdiff diff <before> <after> --include-self
 
 All three filters are applied during `scan` and the excluded files never
 enter the snapshot. To restore them later, re-scan without the filter.
+
+## Watch mode (real-time)
+
+`fdiff watch` opens the NTFS USN journal on every selected volume and prints
+a colored line for each file event in real time. Stop with **Ctrl-C**.
+
+```cmd
+:: monitor every NTFS volume (admin required)
+fdiff watch
+
+:: only watch system drive, only PE files, dump them out as they appear
+fdiff watch --volumes C --ext pe --dump live\
+
+:: tail-like JSONL for downstream tooling (one event per line)
+fdiff watch --json | jq -c '. | select(.kind=="Created")'
+```
+
+Output (text mode):
+```
+2026-06-25 11:02:14  [+]      245760  a3f9c8721b58e90c  C:\Users\X\AppData\Local\Temp\loader.dll
+2026-06-25 11:02:14  [M]       92160  d12fe1aa776c8e1b  C:\Windows\System32\version.dll
+2026-06-25 11:02:15  [R]       17 408  -                 C:\Game\bin\d3d9.dll <- C:\Game\bin\d3d9.dll.bak
+2026-06-25 11:02:16  [-]            -  -                 C:\Game\bin\old.dll
+```
+
+Tags: `[+]` Created, `[M]` Modified, `[R]` Renamed (`new <- old`), `[-]` Deleted.
+
+What it does well:
+* Zero polling — reads NTFS's own change journal, the same mechanism Everything
+  uses for live updates.
+* Picks up every change made by every process (user or system).
+* `--dump <dir>` will copy each Created / Modified / Renamed **PE file** (by
+  extension or by `MZ` magic) into the dir, prefixed by the first 16 hex
+  characters of its SHA-256, and append a JSONL row per event to
+  `watch_manifest.jsonl` in the same dir.
+* `--ext`, `--exclude-path` and the automatic "skip fdiff's own directory"
+  behave exactly like in `scan` / `diff`.
+
+Caveats:
+* NTFS only (no FAT32 / exFAT / ReFS).
+* USN doesn't tell us **which** process caused a change. The hashes plus
+  timestamps let you correlate with Process Monitor / ETW if you really need
+  the PID.
+* Rapid bursts of writes from a single process get coalesced (events on the
+  same path + same kind within 800 ms are emitted only once).
 
 Default DB: `%LOCALAPPDATA%\fdiff\fdiff.db`. Override with `--db <path>`.
 

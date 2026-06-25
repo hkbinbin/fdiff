@@ -26,12 +26,45 @@ pub enum Cmd {
     Volumes,
     /// Take a snapshot of all NTFS volumes (or those listed) and write it to the DB.
     Scan(ScanArgs),
+    /// Real-time NTFS change monitor (USN journal). Stops on Ctrl-C.
+    Watch(WatchArgs),
     /// List stored snapshots.
     List,
     /// Remove a snapshot from the DB.
     Rm { name: String },
     /// Compare two snapshots.
     Diff(DiffArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct WatchArgs {
+    /// Only monitor these volume labels (e.g. `--volumes C,D`).
+    /// Defaults to all NTFS volumes.
+    #[arg(long, value_delimiter = ',')]
+    pub volumes: Vec<String>,
+
+    /// Only emit events for files whose extension matches.
+    /// `--ext pe` expands to the full PE set
+    /// (exe, dll, sys, scr, cpl, ocx, drv, efi, pyd, com).
+    #[arg(long, value_delimiter = ',')]
+    pub ext: Vec<String>,
+
+    /// Skip files whose path starts with this prefix (case-insensitive, repeatable).
+    #[arg(long, value_name = "PATH")]
+    pub exclude_path: Vec<String>,
+
+    /// Copy every Created/Modified/Renamed PE file to this directory and
+    /// append entries to `watch_manifest.jsonl` in there.
+    #[arg(long)]
+    pub dump: Option<PathBuf>,
+
+    /// Emit machine-readable JSONL (one event per line) to stdout.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Don't auto-skip fdiff's own database / dump directories.
+    #[arg(long)]
+    pub include_self: bool,
 }
 
 #[derive(clap::Args, Debug)]

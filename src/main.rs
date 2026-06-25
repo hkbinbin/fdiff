@@ -7,6 +7,7 @@ mod privilege;
 mod report;
 mod store;
 mod volume;
+mod watch;
 
 use std::path::PathBuf;
 use std::thread;
@@ -17,7 +18,7 @@ use clap::Parser;
 use crossbeam_channel::bounded;
 use globset::{Glob, GlobSetBuilder};
 
-use crate::cli::{Cli, Cmd, DiffArgs, ScanArgs};
+use crate::cli::{Cli, Cmd, DiffArgs, ScanArgs, WatchArgs};
 use crate::mft::{FileRecord, ScanOptions};
 
 fn main() {
@@ -32,6 +33,7 @@ fn run() -> Result<()> {
     match args.cmd {
         Cmd::Volumes => cmd_volumes(),
         Cmd::Scan(a) => cmd_scan(args.db, a),
+        Cmd::Watch(a) => cmd_watch(args.db, a),
         Cmd::List => cmd_list(args.db),
         Cmd::Rm { name } => cmd_rm(args.db, &name),
         Cmd::Diff(a) => cmd_diff(args.db, a),
@@ -337,4 +339,70 @@ fn cmd_diff(db: Option<PathBuf>, a: DiffArgs) -> Result<()> {
         println!("\nDumped {} files (incl. before/after sides) to {:?}", n, out);
     }
     Ok(())
+}
+
+fn cmd_watch(db: Option<PathBuf>, a: WatchArgs) -> Result<()> {
+    privilege::ensure_admin()?;
+    privilege::try_enable_backup_privilege();
+
+    // Expand --ext.
+    let mut ext_filter: Vec<String> = Vec::new();
+    for raw in &a.ext {
+        let token = raw.trim().trim_start_matches('.').to_ascii_lowercase();
+        if token.is_empty() {
+            continue;
+        }
+        if token == "pe" {
+            for e in diff::PE_EXT_SET {
+                ext_filter.push((*e).to_string());
+            }
+        } else {
+            ext_filter.push(token);
+        }
+    }
+    ext_filter.sort();
+    ext_filter.dedup();
+
+    // Path exclusions + auto-hide fdiff's own DB folder + dump folder.
+    let mut exclude_prefixes: Vec<String> = a
+        .exclude_path
+        .iter()
+        .map(|p| watch::normalize_prefix(p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if !a.include_self {
+        let db_p = db_path(db.clone())?;
+        if let Some(parent) = db_p.parent() {
+            let p = watch::normalize_prefix(&parent.to_string_lossy());
+            if !p.is_empty() {
+                exclude_prefixes.push(p);
+            }
+        }
+        if let Ok(default) = store::default_db_path() {
+            if let Some(parent) = default.parent() {
+                let p = watch::normalize_prefix(&parent.to_string_lossy());
+                if !p.is_empty() {
+                    exclude_prefixes.push(p);
+                }
+            }
+        }
+        if let Some(out) = a.dump.as_ref() {
+            let p = watch::normalize_prefix(&out.to_string_lossy());
+            if !p.is_empty() {
+                exclude_prefixes.push(p);
+            }
+        }
+        exclude_prefixes.sort();
+        exclude_prefixes.dedup();
+    }
+
+    let opts = watch::WatchOptions {
+        volumes: a.volumes,
+        ext_filter,
+        exclude_prefixes,
+        dump_dir: a.dump,
+        json: a.json,
+        no_close_events: false,
+    };
+    watch::run_watch(opts)
 }
