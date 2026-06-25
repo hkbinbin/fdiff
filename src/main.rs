@@ -114,12 +114,32 @@ fn cmd_scan(db: Option<PathBuf>, a: ScanArgs) -> Result<()> {
         }
         b.build()?
     };
-    let exclude_prefixes: Vec<String> = a
+    let mut exclude_prefixes: Vec<String> = a
         .exclude_path
         .iter()
         .map(|p| ScanOptions::normalize_prefix(p))
         .filter(|p| !p.is_empty())
         .collect();
+
+    // Always exclude fdiff's own DB directory from scans — otherwise every
+    // snapshot picks up the live SQLite WAL it just wrote.
+    if let Some(parent) = db_p.parent() {
+        let p = ScanOptions::normalize_prefix(&parent.to_string_lossy());
+        if !p.is_empty() {
+            exclude_prefixes.push(p);
+        }
+    }
+    if let Ok(default) = store::default_db_path() {
+        if let Some(parent) = default.parent() {
+            let p = ScanOptions::normalize_prefix(&parent.to_string_lossy());
+            if !p.is_empty() {
+                exclude_prefixes.push(p);
+            }
+        }
+    }
+    exclude_prefixes.sort();
+    exclude_prefixes.dedup();
+
     if !exclude_prefixes.is_empty() {
         println!(
             "Excluding {} path prefix(es): {}",
@@ -219,13 +239,88 @@ fn cmd_rm(db: Option<PathBuf>, name: &str) -> Result<()> {
 }
 
 fn cmd_diff(db: Option<PathBuf>, a: DiffArgs) -> Result<()> {
-    let conn = store::open(&db_path(db)?)?;
+    let resolved_db = db_path(db)?;
+    let conn = store::open(&resolved_db)?;
     // Best-effort: make sure indexes exist on older DBs created before v0.3.
     let _ = store::schema::create_indexes(&conn);
+
+    // ---- Extension filter ----
+    // Normalize: strip leading dots, lowercase, expand "pe" shortcut.
+    let mut ext_filter: Vec<String> = Vec::new();
+    for raw in &a.ext {
+        let token = raw.trim().trim_start_matches('.').to_ascii_lowercase();
+        if token.is_empty() {
+            continue;
+        }
+        if token == "pe" {
+            for e in diff::PE_EXT_SET {
+                ext_filter.push((*e).to_string());
+            }
+        } else {
+            ext_filter.push(token);
+        }
+    }
+    ext_filter.sort();
+    ext_filter.dedup();
+
+    // ---- Path-prefix exclusions ----
+    let mut exclude_prefixes: Vec<String> = a
+        .exclude_path
+        .iter()
+        .map(|p| mft::ScanOptions::normalize_prefix(p))
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if !a.include_self {
+        // Always hide fdiff's DB directory unless the user opted in. We add both
+        // the resolved DB's parent directory and the standard %LOCALAPPDATA%
+        // location, so a custom --db path is also covered.
+        if let Some(parent) = resolved_db.parent() {
+            let p = mft::ScanOptions::normalize_prefix(&parent.to_string_lossy());
+            if !p.is_empty() {
+                exclude_prefixes.push(p);
+            }
+        }
+        if let Ok(default) = store::default_db_path() {
+            if let Some(parent) = default.parent() {
+                let p = mft::ScanOptions::normalize_prefix(&parent.to_string_lossy());
+                if !p.is_empty() {
+                    exclude_prefixes.push(p);
+                }
+            }
+        }
+        // If --dump is in use, the dump directory itself isn't part of the
+        // snapshot (it doesn't exist until after the diff runs), but if the
+        // user reuses a path it might be. Hide it pre-emptively.
+        if let Some(out) = a.dump.as_ref() {
+            let p = mft::ScanOptions::normalize_prefix(&out.to_string_lossy());
+            if !p.is_empty() {
+                exclude_prefixes.push(p);
+            }
+        }
+        exclude_prefixes.sort();
+        exclude_prefixes.dedup();
+    }
+
+    if !ext_filter.is_empty() {
+        println!(
+            "Filtering by extension: .{}",
+            ext_filter.join(", .")
+        );
+    }
+    if !exclude_prefixes.is_empty() {
+        println!(
+            "Hiding {} path prefix(es) from diff: {}",
+            exclude_prefixes.len(),
+            exclude_prefixes.join(", ")
+        );
+    }
 
     let opts = diff::DiffOptions {
         include_dirs: a.include_dirs,
         limit_per_category: a.limit,
+        ext_filter,
+        exclude_prefixes,
     };
     let t0 = std::time::Instant::now();
     let rep = diff::diff(&conn, &a.before, &a.after, &opts)?;

@@ -67,11 +67,27 @@ fdiff diff <before> <after>        # console summary (skips directories by defau
 fdiff diff <before> <after> --json # JSON for downstream scripts
 fdiff diff <before> <after> --dump out\
                                    # console + copy all changed PEs + manifest.json
+fdiff diff <before> <after> --ext exe,dll,sys
+                                   # only show files with these extensions
+fdiff diff <before> <after> --ext pe
+                                   # shortcut: expands to the full PE set
+                                   # (exe, dll, sys, scr, cpl, ocx, drv, efi, pyd, com)
+fdiff diff <before> <after> --exclude-path "C:\Users\me\Downloads"
+                                   # hide a path prefix from this diff run
 fdiff diff <before> <after> --include-dirs
                                    # also report directory changes (noisy)
 fdiff diff <before> <after> --limit 200
                                    # cap each category to 200 rows (fast triage)
+fdiff diff <before> <after> --include-self
+                                   # don't auto-hide fdiff's own DB folder
 ```
+
+> **Auto-hide of fdiff's own files.** Both `scan` and `diff` automatically
+> drop anything inside fdiff's database directory (`%LOCALAPPDATA%\fdiff` plus
+> whatever you pass with `--db`). Otherwise every snapshot would pick up its
+> own SQLite WAL writes and the diff would be full of self-noise. Pass
+> `--include-self` (diff) or just point `--db` outside the scanned volumes if
+> you really want to see those rows.
 
 ### Filtering cheatsheet
 

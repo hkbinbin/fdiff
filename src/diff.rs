@@ -59,13 +59,20 @@ pub struct DiffReport {
 }
 
 /// Tunables for `diff()`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DiffOptions {
     /// Include directories in the comparison. Default false — directory mtimes
     /// are constantly rewritten by normal Windows activity and produce noise.
     pub include_dirs: bool,
     /// Cap result count per category. 0 = unlimited.
     pub limit_per_category: usize,
+    /// If non-empty, only files whose lowercased extension is in this set are
+    /// reported. Stored without the leading dot.
+    pub ext_filter: Vec<String>,
+    /// Lowercased path prefixes to drop. Normalized like
+    /// `ScanOptions::normalize_prefix` (forward slashes -> back, no trailing
+    /// backslash). Matched at path-component boundary.
+    pub exclude_prefixes: Vec<String>,
 }
 
 impl Default for DiffOptions {
@@ -73,9 +80,16 @@ impl Default for DiffOptions {
         Self {
             include_dirs: false,
             limit_per_category: 0,
+            ext_filter: Vec::new(),
+            exclude_prefixes: Vec::new(),
         }
     }
 }
+
+/// The canonical "PE" extension set, expanded when the user passes `--ext pe`.
+pub const PE_EXT_SET: &[&str] = &[
+    "exe", "dll", "sys", "scr", "cpl", "ocx", "drv", "efi", "pyd", "com",
+];
 
 pub fn diff(
     conn: &Connection,
@@ -97,10 +111,21 @@ pub fn diff(
     } else {
         "AND is_dir = 0"
     };
-    let limit_sql = if opts.limit_per_category > 0 {
+
+    // If ext/prefix filters are active we apply them in Rust (cheaper than
+    // forcing SQLite to do substring magic). In that case we can't trust SQL
+    // LIMIT to give us N matching rows — we strip it from SQL and enforce the
+    // limit on the Rust side instead.
+    let has_runtime_filter = !opts.ext_filter.is_empty() || !opts.exclude_prefixes.is_empty();
+    let limit_sql = if !has_runtime_filter && opts.limit_per_category > 0 {
         format!(" LIMIT {}", opts.limit_per_category)
     } else {
         String::new()
+    };
+    let limit_rt: usize = if opts.limit_per_category > 0 {
+        opts.limit_per_category
+    } else {
+        usize::MAX
     };
 
     let pb = ProgressBar::new_spinner();
@@ -170,6 +195,16 @@ pub fn diff(
             (true, true) => ChangeKind::RenamedModified,
         };
 
+        // Apply runtime filter on the visible (after) path; for Renamed we
+        // also keep entries that match before-side, so a tracked .dll being
+        // renamed to .tmp still shows up.
+        if !path_keep(&a_path, opts) && !path_keep(&b_path, opts) {
+            continue;
+        }
+
+        if report.modified.len() >= limit_rt {
+            break;
+        }
         report.modified.push(ChangeEntry {
             kind,
             before: Some(FileSide {
@@ -218,10 +253,17 @@ pub fn diff(
     let mut stmt = conn.prepare(&q_add)?;
     let mut it = stmt.query(rusqlite::params![before_id, after_id])?;
     while let Some(r) = it.next()? {
+        let side = read_side(r)?;
+        if !path_keep(&side.path, opts) {
+            continue;
+        }
+        if report.added.len() >= limit_rt {
+            break;
+        }
         report.added.push(ChangeEntry {
             kind: ChangeKind::Added,
             before: None,
-            after: Some(read_side(r)?),
+            after: Some(side),
         });
     }
     drop(it);
@@ -251,9 +293,16 @@ pub fn diff(
     let mut stmt = conn.prepare(&q_rm)?;
     let mut it = stmt.query(rusqlite::params![before_id, after_id])?;
     while let Some(r) = it.next()? {
+        let side = read_side(r)?;
+        if !path_keep(&side.path, opts) {
+            continue;
+        }
+        if report.removed.len() >= limit_rt {
+            break;
+        }
         report.removed.push(ChangeEntry {
             kind: ChangeKind::Removed,
-            before: Some(read_side(r)?),
+            before: Some(side),
             after: None,
         });
     }
@@ -298,6 +347,13 @@ pub fn diff(
         let a_size: i64 = r.get(7)?;
         let a_mtime: i64 = r.get(8)?;
         let a_sha: Option<Vec<u8>> = r.get(9)?;
+
+        if !path_keep(&path, opts) {
+            continue;
+        }
+        if report.replaced.len() >= limit_rt {
+            break;
+        }
 
         report.replaced.push(ChangeEntry {
             kind: ChangeKind::Replaced,
@@ -348,6 +404,50 @@ fn read_side(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileSide> {
         mtime,
         sha256_hex: sha.as_ref().map(hex),
     })
+}
+
+/// Decide whether to keep a row given current DiffOptions.
+/// Fast-path: nothing configured → always true.
+fn path_keep(path: &str, opts: &DiffOptions) -> bool {
+    if !opts.exclude_prefixes.is_empty() {
+        let lower = path.to_ascii_lowercase();
+        for p in &opts.exclude_prefixes {
+            if starts_with_prefix(&lower, p) {
+                return false;
+            }
+        }
+    }
+    if !opts.ext_filter.is_empty() {
+        let ext = extension_of(path);
+        if !opts.ext_filter.iter().any(|e| e == &ext) {
+            return false;
+        }
+    }
+    true
+}
+
+fn extension_of(path: &str) -> String {
+    // Find the file name portion (after last \ or /).
+    let name_start = path
+        .rfind(|c| c == '\\' || c == '/')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let name = &path[name_start..];
+    match name.rfind('.') {
+        Some(i) if i > 0 && i + 1 < name.len() => name[i + 1..].to_ascii_lowercase(),
+        _ => String::new(),
+    }
+}
+
+fn starts_with_prefix(lowercased_path: &str, prefix: &str) -> bool {
+    if !lowercased_path.starts_with(prefix) {
+        return false;
+    }
+    match lowercased_path.as_bytes().get(prefix.len()) {
+        None => true,
+        Some(b'\\') | Some(b'/') => true,
+        _ => false,
+    }
 }
 
 fn hex(v: &Vec<u8>) -> String {

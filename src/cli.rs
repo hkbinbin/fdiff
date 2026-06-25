@@ -91,6 +91,24 @@ pub struct DiffArgs {
     #[arg(long)]
     pub include_dirs: bool,
 
+    /// Only show files whose extension matches. Comma-separated, no dot, case
+    /// insensitive. Example: `--ext exe,dll,sys`. A handy shortcut for the
+    /// common forensic case is `--ext pe`, which expands to the full PE set
+    /// (exe, dll, sys, scr, cpl, ocx, drv, efi, pyd, com).
+    #[arg(long, value_delimiter = ',')]
+    pub ext: Vec<String>,
+
+    /// Skip files whose path starts with this prefix (case-insensitive,
+    /// repeatable). Same matching rules as `scan --exclude-path`.
+    #[arg(long, value_name = "PATH")]
+    pub exclude_path: Vec<String>,
+
+    /// Don't auto-skip fdiff's own database / dump directories. By default
+    /// %LOCALAPPDATA%\fdiff and the path passed to --dump are hidden, since
+    /// scans always pick up our own writes.
+    #[arg(long)]
+    pub include_self: bool,
+
     /// Cap each category (Added / Removed / Modified / Replaced) to this many
     /// rows. 0 = unlimited. Useful when you only want a quick triage view.
     #[arg(long, default_value_t = 0)]
