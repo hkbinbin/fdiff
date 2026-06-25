@@ -332,11 +332,22 @@ src/
 
 ## Limitations
 
-* NTFS only. ReFS, FAT32, exFAT are intentionally skipped.
-* `watch` doesn't carry process / PID info — USN doesn't expose it.
-  Correlate with Process Monitor / ETW if you need that.
-* No Authenticode trust filtering yet — you'll see noise from Windows Update.
-  Use the persistent exclusion config (see above) to mute the typical sources.
+* **NTFS only.** ReFS, FAT32, exFAT are intentionally skipped — both `scan`
+  and `watch` rely on NTFS-specific structures (`$MFT` / USN journal).
+* **`watch` is forward-only.** It starts at the journal's current `NextUsn`,
+  so changes that happened *before* you launched `fdiff watch` are not
+  replayed. Start the watcher first, then run the suspect program.
+* **`watch` has no process / PID.** USN doesn't expose it. Use Process Monitor
+  or ETW to correlate if you need the originating PID.
+* **`watch` rename pairing is per-volume.** A file moved across drive letters
+  shows up as Deleted on one volume and Created on the other; the
+  `renamed_from` field is empty in that case.
+* **Hash skips files > 200 MB.** PE droppers in cheat/malware are almost
+  always far smaller, but very large payloads will appear in the diff
+  *without* a SHA-256 column. Adjust `hasher::SIZE_LIMIT` to change this.
+* **No Authenticode trust filtering yet.** You'll see noise from Windows
+  Update and other signed Microsoft binaries. Use the persistent exclusion
+  config (see above) to mute the typical sources.
 
 ---
 
