@@ -220,7 +220,16 @@ fn cmd_rm(db: Option<PathBuf>, name: &str) -> Result<()> {
 
 fn cmd_diff(db: Option<PathBuf>, a: DiffArgs) -> Result<()> {
     let conn = store::open(&db_path(db)?)?;
-    let rep = diff::diff(&conn, &a.before, &a.after)?;
+    // Best-effort: make sure indexes exist on older DBs created before v0.3.
+    let _ = store::schema::create_indexes(&conn);
+
+    let opts = diff::DiffOptions {
+        include_dirs: a.include_dirs,
+        limit_per_category: a.limit,
+    };
+    let t0 = std::time::Instant::now();
+    let rep = diff::diff(&conn, &a.before, &a.after, &opts)?;
+    eprintln!("(diff took {:.2}s)", t0.elapsed().as_secs_f32());
 
     if a.json {
         println!("{}", report::to_json(&rep));

@@ -55,5 +55,8 @@ pub fn create_indexes(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_files_sha  ON files(sha256);
         "#,
     )?;
+    // Let the SQLite planner pick the right join order for diff queries.
+    // Cheap on a fresh DB, dramatic effect on join cost.
+    let _ = conn.execute_batch("ANALYZE;");
     Ok(())
 }

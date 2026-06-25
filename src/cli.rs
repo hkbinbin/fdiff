@@ -85,4 +85,14 @@ pub struct DiffArgs {
     /// Copy every changed PE file to this directory and write manifest.json there.
     #[arg(long)]
     pub dump: Option<PathBuf>,
+
+    /// Include directories in the comparison. Off by default — Windows
+    /// constantly rewrites directory mtimes which produces a lot of noise.
+    #[arg(long)]
+    pub include_dirs: bool,
+
+    /// Cap each category (Added / Removed / Modified / Replaced) to this many
+    /// rows. 0 = unlimited. Useful when you only want a quick triage view.
+    #[arg(long, default_value_t = 0)]
+    pub limit: usize,
 }

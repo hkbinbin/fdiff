@@ -63,10 +63,14 @@ fdiff scan <name> --no-hash        # skip SHA-256 stage (fastest)
 fdiff scan <name> --blake3         # also compute BLAKE3
 fdiff list                         # list stored snapshots
 fdiff rm <name>                    # delete a snapshot
-fdiff diff <before> <after>        # console summary
+fdiff diff <before> <after>        # console summary (skips directories by default)
 fdiff diff <before> <after> --json # JSON for downstream scripts
 fdiff diff <before> <after> --dump out\
                                    # console + copy all changed PEs + manifest.json
+fdiff diff <before> <after> --include-dirs
+                                   # also report directory changes (noisy)
+fdiff diff <before> <after> --limit 200
+                                   # cap each category to 200 rows (fast triage)
 ```
 
 ### Filtering cheatsheet
@@ -95,6 +99,28 @@ Default DB: `%LOCALAPPDATA%\fdiff\fdiff.db`. Override with `--db <path>`.
 * **Renamed**   — same FRN, different path. Same content moved.
 * **RenamedModified** — same FRN, moved + content changed.
 * **Replaced**  — **path is identical but FRN changed**. Original was deleted and a new file took its name. This is the classic DLL-hijack signature; it gets its own section in the report.
+
+### Diff performance
+
+`fdiff diff` pushes nearly all filtering into SQLite. On a million-row snapshot
+expect roughly:
+
+| Phase                | Time (NVMe SSD) |
+|----------------------|-----------------|
+| Modified / Renamed   | 1–3 s |
+| Added                | 1–2 s |
+| Removed              | 1–2 s |
+| Replaced             | 1–2 s |
+| **Total**            | **~5–8 s** |
+
+If your last diff was much slower than this, two likely causes:
+
+1. **DB created before v0.3** — the indexes (`idx_files_path`, `idx_files_sha`)
+   may be missing. `fdiff diff` now rebuilds them automatically on first run,
+   then `ANALYZE` is invoked so the query planner picks merge joins. The
+   first run after upgrade rebuilds them once; subsequent runs are fast.
+2. **Comparing across millions of files including directories** — pass
+   `--limit 500` for a triage view, or omit `--include-dirs` (default).
 
 ## Hash policy
 

@@ -1,8 +1,23 @@
-//! Two-snapshot diff. Joins on `(volume, frn)` for primary identity tracking
-//! and on `(volume, path)` to detect "Replaced" — same path but different FRN,
-//! the classic DLL-hijack signature.
+//! Two-snapshot diff.
+//!
+//! Speed strategy: do as much filtering as possible inside SQLite (which has
+//! the right indexes), and only ship to Rust the rows that are actually
+//! changed. We split the comparison into four independent queries instead of
+//! one big FULL OUTER JOIN:
+//!
+//! 1. **Modified / Renamed** — `b INNER JOIN a ON (snapshot, volume, frn)`
+//!    with a WHERE clause that filters out unchanged rows in the engine.
+//! 2. **Added**             — rows present in `after` but not in `before`
+//!                            (`NOT EXISTS` lets the planner use the PK).
+//! 3. **Removed**           — symmetric of Added.
+//! 4. **Replaced**          — same `(volume, path)` but different `frn`,
+//!                            the DLL-hijack signature; uses `idx_files_path`.
+//!
+//! By default directories are excluded (their mtime is noisy). Pass
+//! `--include-dirs` to bring them back.
 
 use anyhow::{anyhow, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
@@ -11,9 +26,9 @@ pub enum ChangeKind {
     Added,
     Removed,
     Modified,
-    Renamed,           // same FRN, different path
-    Replaced,          // same path, different FRN — DLL hijack signal
-    RenamedModified,   // same FRN, path + content both changed
+    Renamed,         // same FRN, different path
+    Replaced,        // same path, different FRN — DLL hijack signal
+    RenamedModified, // same FRN, path + content both changed
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,10 +58,30 @@ pub struct DiffReport {
     pub replaced: Vec<ChangeEntry>,
 }
 
+/// Tunables for `diff()`.
+#[derive(Debug, Clone, Copy)]
+pub struct DiffOptions {
+    /// Include directories in the comparison. Default false — directory mtimes
+    /// are constantly rewritten by normal Windows activity and produce noise.
+    pub include_dirs: bool,
+    /// Cap result count per category. 0 = unlimited.
+    pub limit_per_category: usize,
+}
+
+impl Default for DiffOptions {
+    fn default() -> Self {
+        Self {
+            include_dirs: false,
+            limit_per_category: 0,
+        }
+    }
+}
+
 pub fn diff(
     conn: &Connection,
     before_name: &str,
     after_name: &str,
+    opts: &DiffOptions,
 ) -> Result<DiffReport> {
     let before_id = snapshot_id(conn, before_name)?;
     let after_id = snapshot_id(conn, after_name)?;
@@ -57,92 +92,200 @@ pub fn diff(
         ..Default::default()
     };
 
-    // --- 1. FRN-based JOIN: classifies Added / Removed / Modified / Renamed ---
+    let _dir_pred = if opts.include_dirs {
+        "" // no extra predicate
+    } else {
+        "AND is_dir = 0"
+    };
+    let limit_sql = if opts.limit_per_category > 0 {
+        format!(" LIMIT {}", opts.limit_per_category)
+    } else {
+        String::new()
+    };
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} {msg}")
+            .unwrap()
+            .tick_chars("⠁⠃⠇⡇⣇⣧⣷⣿"),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(120));
+
+    // -----------------------------------------------------------------------
+    // 1) Modified / Renamed / RenamedModified — INNER JOIN, WHERE in SQL.
     //
-    // We do FULL OUTER JOIN via UNION ALL of two LEFT JOINs.
-    let q_frn = r#"
-        SELECT
-            b.volume AS b_volume, b.frn AS b_frn, b.path AS b_path,
-            b.size AS b_size, b.mtime AS b_mtime, b.sha256 AS b_sha,
-            a.volume AS a_volume, a.frn AS a_frn, a.path AS a_path,
-            a.size AS a_size, a.mtime AS a_mtime, a.sha256 AS a_sha
-        FROM (SELECT * FROM files WHERE snapshot_id = ?1) b
-        LEFT JOIN (SELECT * FROM files WHERE snapshot_id = ?2) a
-            ON a.volume = b.volume AND a.frn = b.frn
-        UNION ALL
+    // We let SQLite skip every row that's unchanged. Walks through the PK
+    // (snapshot_id, volume, frn) on both sides — effectively a merge join.
+    // -----------------------------------------------------------------------
+    pb.set_message("comparing FRN-matched rows...");
+    let q_mod = format!(
+        r#"
         SELECT
             b.volume, b.frn, b.path, b.size, b.mtime, b.sha256,
-            a.volume, a.frn, a.path, a.size, a.mtime, a.sha256
-        FROM (SELECT * FROM files WHERE snapshot_id = ?2) a
-        LEFT JOIN (SELECT * FROM files WHERE snapshot_id = ?1) b
-            ON a.volume = b.volume AND a.frn = b.frn
-        WHERE b.frn IS NULL
-    "#;
+                     a.path, a.size, a.mtime, a.sha256
+        FROM files b
+        INNER JOIN files a
+            ON a.snapshot_id = ?2
+           AND a.volume = b.volume
+           AND a.frn    = b.frn
+        WHERE b.snapshot_id = ?1
+          {dir_pred_b}
+          {dir_pred_a}
+          AND (
+              b.path <> a.path
+           OR (b.sha256 IS NOT NULL AND a.sha256 IS NOT NULL AND b.sha256 <> a.sha256)
+           OR ((b.sha256 IS NULL OR a.sha256 IS NULL) AND (b.size <> a.size OR b.mtime <> a.mtime))
+          )
+        {limit}
+        "#,
+        dir_pred_b = if opts.include_dirs { "" } else { "AND b.is_dir = 0" },
+        dir_pred_a = if opts.include_dirs { "" } else { "AND a.is_dir = 0" },
+        limit = limit_sql,
+    );
 
-    let mut stmt = conn.prepare(q_frn)?;
+    let mut stmt = conn.prepare(&q_mod)?;
     let mut it = stmt.query(rusqlite::params![before_id, after_id])?;
-
     while let Some(r) = it.next()? {
-        let b_vol: Option<String> = r.get(0)?;
-        let b_frn: Option<i64> = r.get(1)?;
-        let b_path: Option<String> = r.get(2)?;
-        let b_size: Option<i64> = r.get(3)?;
-        let b_mtime: Option<i64> = r.get(4)?;
+        let volume: String = r.get(0)?;
+        let b_frn: i64 = r.get(1)?;
+        let b_path: String = r.get(2)?;
+        let b_size: i64 = r.get(3)?;
+        let b_mtime: i64 = r.get(4)?;
         let b_sha: Option<Vec<u8>> = r.get(5)?;
 
-        let a_vol: Option<String> = r.get(6)?;
-        let a_frn: Option<i64> = r.get(7)?;
-        let a_path: Option<String> = r.get(8)?;
-        let a_size: Option<i64> = r.get(9)?;
-        let a_mtime: Option<i64> = r.get(10)?;
-        let a_sha: Option<Vec<u8>> = r.get(11)?;
+        let a_path: String = r.get(6)?;
+        let a_size: i64 = r.get(7)?;
+        let a_mtime: i64 = r.get(8)?;
+        let a_sha: Option<Vec<u8>> = r.get(9)?;
 
-        let before = make_side(b_vol, b_frn, b_path, b_size, b_mtime, b_sha);
-        let after = make_side(a_vol, a_frn, a_path, a_size, a_mtime, a_sha);
+        let path_changed = b_path != a_path;
+        let content_changed = match (&b_sha, &a_sha) {
+            (Some(x), Some(y)) => x != y,
+            _ => b_size != a_size || b_mtime != a_mtime,
+        };
+        let kind = match (path_changed, content_changed) {
+            (false, false) => continue, // shouldn't happen — SQL already filtered
+            (true, false) => ChangeKind::Renamed,
+            (false, true) => ChangeKind::Modified,
+            (true, true) => ChangeKind::RenamedModified,
+        };
 
-        match (&before, &after) {
-            (Some(b), Some(a)) => {
-                let path_changed = b.path != a.path;
-                let content_changed = content_changed(b, a);
-                let kind = match (path_changed, content_changed) {
-                    (false, false) => continue, // identical, skip
-                    (true, false) => ChangeKind::Renamed,
-                    (false, true) => ChangeKind::Modified,
-                    (true, true) => ChangeKind::RenamedModified,
-                };
-                report
-                    .modified
-                    .push(ChangeEntry { kind, before: Some(b.clone()), after: Some(a.clone()) });
-            }
-            (Some(b), None) => report.removed.push(ChangeEntry {
-                kind: ChangeKind::Removed,
-                before: Some(b.clone()),
-                after: None,
+        report.modified.push(ChangeEntry {
+            kind,
+            before: Some(FileSide {
+                volume: volume.clone(),
+                frn: b_frn as u64,
+                path: b_path,
+                size: b_size as u64,
+                mtime: b_mtime,
+                sha256_hex: b_sha.as_ref().map(hex),
             }),
-            (None, Some(a)) => report.added.push(ChangeEntry {
-                kind: ChangeKind::Added,
-                before: None,
-                after: Some(a.clone()),
+            after: Some(FileSide {
+                volume,
+                frn: b_frn as u64,
+                path: a_path,
+                size: a_size as u64,
+                mtime: a_mtime,
+                sha256_hex: a_sha.as_ref().map(hex),
             }),
-            (None, None) => {}
-        }
+        });
     }
     drop(it);
     drop(stmt);
+    pb.set_message(format!("found {} modified / renamed", report.modified.len()));
 
-    // --- 2. PATH-based JOIN: classifies Replaced (same path, FRN changed) ---
-    let q_path = r#"
+    // -----------------------------------------------------------------------
+    // 2) Added: NOT EXISTS in `before`. NOT EXISTS lets the planner do an
+    //    indexed PK lookup per row of `after` — cheap.
+    // -----------------------------------------------------------------------
+    pb.set_message("scanning Added...");
+    let q_add = format!(
+        r#"
+        SELECT a.volume, a.frn, a.path, a.size, a.mtime, a.sha256
+        FROM files a
+        WHERE a.snapshot_id = ?2 {dir_pred}
+          AND NOT EXISTS (
+              SELECT 1 FROM files b
+              WHERE b.snapshot_id = ?1
+                AND b.volume = a.volume
+                AND b.frn    = a.frn
+          )
+        {limit}
+        "#,
+        dir_pred = if opts.include_dirs { "" } else { "AND a.is_dir = 0" },
+        limit = limit_sql,
+    );
+    let mut stmt = conn.prepare(&q_add)?;
+    let mut it = stmt.query(rusqlite::params![before_id, after_id])?;
+    while let Some(r) = it.next()? {
+        report.added.push(ChangeEntry {
+            kind: ChangeKind::Added,
+            before: None,
+            after: Some(read_side(r)?),
+        });
+    }
+    drop(it);
+    drop(stmt);
+    pb.set_message(format!("found {} added", report.added.len()));
+
+    // -----------------------------------------------------------------------
+    // 3) Removed: symmetric.
+    // -----------------------------------------------------------------------
+    pb.set_message("scanning Removed...");
+    let q_rm = format!(
+        r#"
+        SELECT b.volume, b.frn, b.path, b.size, b.mtime, b.sha256
+        FROM files b
+        WHERE b.snapshot_id = ?1 {dir_pred}
+          AND NOT EXISTS (
+              SELECT 1 FROM files a
+              WHERE a.snapshot_id = ?2
+                AND a.volume = b.volume
+                AND a.frn    = b.frn
+          )
+        {limit}
+        "#,
+        dir_pred = if opts.include_dirs { "" } else { "AND b.is_dir = 0" },
+        limit = limit_sql,
+    );
+    let mut stmt = conn.prepare(&q_rm)?;
+    let mut it = stmt.query(rusqlite::params![before_id, after_id])?;
+    while let Some(r) = it.next()? {
+        report.removed.push(ChangeEntry {
+            kind: ChangeKind::Removed,
+            before: Some(read_side(r)?),
+            after: None,
+        });
+    }
+    drop(it);
+    drop(stmt);
+    pb.set_message(format!("found {} removed", report.removed.len()));
+
+    // -----------------------------------------------------------------------
+    // 4) Replaced: same path, different FRN. Uses idx_files_path.
+    // -----------------------------------------------------------------------
+    pb.set_message("scanning Replaced...");
+    let q_repl = format!(
+        r#"
         SELECT
             b.volume, b.frn, b.path, b.size, b.mtime, b.sha256,
             a.frn,    a.size,  a.mtime,  a.sha256
-        FROM (SELECT volume, frn, path, size, mtime, sha256 FROM files
-              WHERE snapshot_id = ?1 AND is_dir = 0) b
-        JOIN  (SELECT volume, frn, path, size, mtime, sha256 FROM files
-              WHERE snapshot_id = ?2 AND is_dir = 0) a
-            ON a.volume = b.volume AND a.path = b.path
-        WHERE a.frn <> b.frn
-    "#;
-    let mut stmt = conn.prepare(q_path)?;
+        FROM files b
+        INNER JOIN files a
+            ON a.snapshot_id = ?2
+           AND a.volume = b.volume
+           AND a.path   = b.path
+        WHERE b.snapshot_id = ?1
+          AND a.frn <> b.frn
+          {dir_pred_b}
+          {dir_pred_a}
+        {limit}
+        "#,
+        dir_pred_b = if opts.include_dirs { "" } else { "AND b.is_dir = 0" },
+        dir_pred_a = if opts.include_dirs { "" } else { "AND a.is_dir = 0" },
+        limit = limit_sql,
+    );
+    let mut stmt = conn.prepare(&q_repl)?;
     let mut it = stmt.query(rusqlite::params![before_id, after_id])?;
     while let Some(r) = it.next()? {
         let volume: String = r.get(0)?;
@@ -176,37 +319,35 @@ pub fn diff(
             }),
         });
     }
+    drop(it);
+    drop(stmt);
+
+    pb.finish_with_message(format!(
+        "diff done: +{} -{} ~{} !{}",
+        report.added.len(),
+        report.removed.len(),
+        report.modified.len(),
+        report.replaced.len(),
+    ));
 
     Ok(report)
 }
 
-fn make_side(
-    vol: Option<String>,
-    frn: Option<i64>,
-    path: Option<String>,
-    size: Option<i64>,
-    mtime: Option<i64>,
-    sha: Option<Vec<u8>>,
-) -> Option<FileSide> {
-    match (vol, frn, path, size, mtime) {
-        (Some(v), Some(f), Some(p), Some(s), Some(m)) => Some(FileSide {
-            volume: v,
-            frn: f as u64,
-            path: p,
-            size: s as u64,
-            mtime: m,
-            sha256_hex: sha.as_ref().map(hex),
-        }),
-        _ => None,
-    }
-}
-
-fn content_changed(b: &FileSide, a: &FileSide) -> bool {
-    match (&b.sha256_hex, &a.sha256_hex) {
-        (Some(x), Some(y)) => x != y,
-        // hash missing — fall back to size+mtime
-        _ => b.size != a.size || b.mtime != a.mtime,
-    }
+fn read_side(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileSide> {
+    let volume: String = r.get(0)?;
+    let frn: i64 = r.get(1)?;
+    let path: String = r.get(2)?;
+    let size: i64 = r.get(3)?;
+    let mtime: i64 = r.get(4)?;
+    let sha: Option<Vec<u8>> = r.get(5)?;
+    Ok(FileSide {
+        volume,
+        frn: frn as u64,
+        path,
+        size: size as u64,
+        mtime,
+        sha256_hex: sha.as_ref().map(hex),
+    })
 }
 
 fn hex(v: &Vec<u8>) -> String {
