@@ -36,6 +36,9 @@ pub struct ScanOptions {
     /// one of these is skipped. Paths are normalized to use backslashes and
     /// have no trailing separator.
     pub exclude_prefixes: Vec<String>,
+    /// Compiled regexes to match against full path. Pre-compiled so the hot
+    /// loop just does `re.is_match(path)`.
+    pub exclude_regexes: Vec<regex::Regex>,
 }
 
 impl ScanOptions {
@@ -99,6 +102,14 @@ pub fn scan_volume(
 
         // 2) Glob filter.
         if !opts.exclude.is_empty() && opts.exclude.is_match(&path_str) {
+            skipped += 1;
+            continue;
+        }
+
+        // 3) Regex filter.
+        if !opts.exclude_regexes.is_empty()
+            && opts.exclude_regexes.iter().any(|r| r.is_match(&path_str))
+        {
             skipped += 1;
             continue;
         }

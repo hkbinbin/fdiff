@@ -34,6 +34,30 @@ pub enum Cmd {
     Rm { name: String },
     /// Compare two snapshots.
     Diff(DiffArgs),
+    /// Manage persistent exclusion rules (saved to `%LOCALAPPDATA%\fdiff\config.json`).
+    #[command(subcommand)]
+    Config(ConfigCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCmd {
+    /// Show the current saved rules and config file path.
+    Show,
+    /// Add an exclusion rule. Kind defaults to `prefix`.
+    Add {
+        /// Pattern. Variables `${LOCALAPPDATA}` / `%LOCALAPPDATA%` are
+        /// expanded at runtime.
+        pattern: String,
+        /// Rule kind: prefix | glob | regex.
+        #[arg(long, default_value = "prefix")]
+        kind: String,
+    },
+    /// Remove a rule by 1-based index (see `config show`) or exact pattern.
+    Rm { key: String },
+    /// Replace the config with the seeded defaults (Edge / ContentDeliveryManager / etc).
+    Reset,
+    /// Print the config file's absolute path.
+    Path,
 }
 
 #[derive(clap::Args, Debug)]
@@ -52,6 +76,15 @@ pub struct WatchArgs {
     /// Skip files whose path starts with this prefix (case-insensitive, repeatable).
     #[arg(long, value_name = "PATH")]
     pub exclude_path: Vec<String>,
+
+    /// Regex pattern(s) to exclude (matched against full path, case-insensitive
+    /// by default). Repeatable.
+    #[arg(long, value_name = "REGEX")]
+    pub exclude_regex: Vec<String>,
+
+    /// Ignore the saved config at %LOCALAPPDATA%\fdiff\config.json for this run.
+    #[arg(long)]
+    pub no_config: bool,
 
     /// Copy every Created/Modified/Renamed PE file to this directory and
     /// append entries to `watch_manifest.jsonl` in there.
@@ -92,6 +125,15 @@ pub struct ScanArgs {
     /// Repeatable. Example: `--exclude '**/$Recycle.Bin/**'`.
     #[arg(long)]
     pub exclude: Vec<String>,
+
+    /// Regex pattern(s) to exclude (matched against full path, case-insensitive
+    /// by default). Repeatable.
+    #[arg(long, value_name = "REGEX")]
+    pub exclude_regex: Vec<String>,
+
+    /// Ignore the saved config at %LOCALAPPDATA%\fdiff\config.json for this run.
+    #[arg(long)]
+    pub no_config: bool,
 
     /// Skip the hash stage entirely (much faster).
     #[arg(long)]
@@ -135,6 +177,19 @@ pub struct DiffArgs {
     /// repeatable). Same matching rules as `scan --exclude-path`.
     #[arg(long, value_name = "PATH")]
     pub exclude_path: Vec<String>,
+
+    /// Regex pattern(s) to exclude (matched against full path, case-insensitive
+    /// by default). Repeatable.
+    #[arg(long, value_name = "REGEX")]
+    pub exclude_regex: Vec<String>,
+
+    /// Glob pattern(s) to exclude (matched against full path).
+    #[arg(long)]
+    pub exclude: Vec<String>,
+
+    /// Ignore the saved config at %LOCALAPPDATA%\fdiff\config.json for this run.
+    #[arg(long)]
+    pub no_config: bool,
 
     /// Don't auto-skip fdiff's own database / dump directories. By default
     /// %LOCALAPPDATA%\fdiff and the path passed to --dump are hidden, since

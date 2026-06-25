@@ -83,6 +83,8 @@ pub struct WatchOptions {
     pub volumes: Vec<String>,
     pub ext_filter: Vec<String>,
     pub exclude_prefixes: Vec<String>,
+    pub exclude_regexes: Vec<regex::Regex>,
+    pub exclude_globs: Vec<globset::GlobMatcher>,
     pub dump_dir: Option<PathBuf>,
     pub json: bool,
     #[allow(dead_code)]
@@ -165,12 +167,18 @@ pub fn run_watch(opts: WatchOptions) -> Result<()> {
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(mut ev) => {
-                // Filter: ext / exclude path.
+                // Filter: ext / exclude path / globs / regexes.
                 if !opts.exclude_prefixes.is_empty() {
                     let lower = ev.path.to_ascii_lowercase();
                     if opts.exclude_prefixes.iter().any(|p| starts_with(&lower, p)) {
                         continue;
                     }
+                }
+                if opts.exclude_globs.iter().any(|g| g.is_match(&ev.path)) {
+                    continue;
+                }
+                if opts.exclude_regexes.iter().any(|r| r.is_match(&ev.path)) {
+                    continue;
                 }
                 if !opts.ext_filter.is_empty() {
                     let ext = ext_of(&ev.path);

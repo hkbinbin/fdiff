@@ -103,9 +103,62 @@ fdiff diff <before> <after> --include-self
   `C:\FooBar`). Repeatable.
 * `--exclude '<glob>'` — full-path glob exclusion. Use this when you need
   wildcards (`**/$Recycle.Bin/**`).
+* `--exclude-regex '<regex>'` — full-path regex exclusion (Rust regex flavor,
+  case-insensitive by default). Repeatable.
 
 All three filters are applied during `scan` and the excluded files never
 enter the snapshot. To restore them later, re-scan without the filter.
+
+## Persistent exclusion config (`fdiff config`)
+
+Tired of typing the same `--exclude-path` every time? Save them once:
+
+```cmd
+fdiff config show                       :: list current rules + config file path
+fdiff config add "C:\Users\me\AppData\Local\Microsoft\Edge"
+fdiff config add "**/$Recycle.Bin/**"            --kind glob
+fdiff config add ".*\\ContentDeliveryManager.*"  --kind regex
+fdiff config rm 2                                :: remove rule by index
+fdiff config rm "C:\Users\me\AppData\Local\Microsoft\Edge"
+fdiff config reset                               :: restore the shipped defaults
+fdiff config path
+```
+
+Rules are saved to `%LOCALAPPDATA%\fdiff\config.json` and are auto-applied by
+every subsequent `scan`, `diff`, and `watch` run. Use `--no-config` to ignore
+them for one invocation.
+
+### Rule kinds
+
+| Kind     | Match | Example |
+|----------|-------|---------|
+| `prefix` (default) | full path starts with this string at a component boundary, case-insensitive | `C:\Users\me\AppData\Local\Microsoft\Edge` |
+| `glob`   | full-path glob (globset crate) | `${LOCALAPPDATA}\Packages\Microsoft.Windows.ContentDeliveryManager*` |
+| `regex`  | full-path regex (Rust regex crate, case-insensitive by default — prepend `(?-i)` to override) | `.*\\AppData\\Local\\Temp\\.*\.tmp$` |
+
+### Variables in patterns
+
+You can embed `${LOCALAPPDATA}` or `%LOCALAPPDATA%` and they get expanded at
+runtime — so the same config works across machines / accounts:
+
+```json
+{
+  "exclude_paths": [
+    { "kind": "prefix", "pattern": "${LOCALAPPDATA}\\Microsoft\\Edge" },
+    { "kind": "glob",   "pattern": "${LOCALAPPDATA}\\Packages\\Microsoft.Windows.ContentDeliveryManager*" }
+  ]
+}
+```
+
+### Shipped defaults
+
+When you first run any command without an existing config, fdiff seeds these:
+
+* `${LOCALAPPDATA}\Microsoft\Edge`               (prefix)
+* `${LOCALAPPDATA}\Microsoft\Windows`            (prefix — catches WebCache etc.)
+* `${LOCALAPPDATA}\Packages\Microsoft.Windows.ContentDeliveryManager*`  (glob)
+
+Run `fdiff config show` to see the current set.
 
 ## Watch mode (real-time)
 

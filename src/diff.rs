@@ -73,6 +73,10 @@ pub struct DiffOptions {
     /// `ScanOptions::normalize_prefix` (forward slashes -> back, no trailing
     /// backslash). Matched at path-component boundary.
     pub exclude_prefixes: Vec<String>,
+    /// Compiled regexes to drop (matched against full path).
+    pub exclude_regexes: Vec<regex::Regex>,
+    /// Compiled globs to drop.
+    pub exclude_globs: Vec<globset::GlobMatcher>,
 }
 
 impl Default for DiffOptions {
@@ -82,6 +86,8 @@ impl Default for DiffOptions {
             limit_per_category: 0,
             ext_filter: Vec::new(),
             exclude_prefixes: Vec::new(),
+            exclude_regexes: Vec::new(),
+            exclude_globs: Vec::new(),
         }
     }
 }
@@ -116,7 +122,10 @@ pub fn diff(
     // forcing SQLite to do substring magic). In that case we can't trust SQL
     // LIMIT to give us N matching rows — we strip it from SQL and enforce the
     // limit on the Rust side instead.
-    let has_runtime_filter = !opts.ext_filter.is_empty() || !opts.exclude_prefixes.is_empty();
+    let has_runtime_filter = !opts.ext_filter.is_empty()
+        || !opts.exclude_prefixes.is_empty()
+        || !opts.exclude_regexes.is_empty()
+        || !opts.exclude_globs.is_empty();
     let limit_sql = if !has_runtime_filter && opts.limit_per_category > 0 {
         format!(" LIMIT {}", opts.limit_per_category)
     } else {
@@ -416,6 +425,12 @@ fn path_keep(path: &str, opts: &DiffOptions) -> bool {
                 return false;
             }
         }
+    }
+    if opts.exclude_globs.iter().any(|g| g.is_match(path)) {
+        return false;
+    }
+    if opts.exclude_regexes.iter().any(|r| r.is_match(path)) {
+        return false;
     }
     if !opts.ext_filter.is_empty() {
         let ext = extension_of(path);

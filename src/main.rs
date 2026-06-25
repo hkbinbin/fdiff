@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 mod diff;
 mod dump;
 mod hasher;
@@ -18,7 +19,7 @@ use clap::Parser;
 use crossbeam_channel::bounded;
 use globset::{Glob, GlobSetBuilder};
 
-use crate::cli::{Cli, Cmd, DiffArgs, ScanArgs, WatchArgs};
+use crate::cli::{Cli, Cmd, ConfigCmd, DiffArgs, ScanArgs, WatchArgs};
 use crate::mft::{FileRecord, ScanOptions};
 
 fn main() {
@@ -37,6 +38,7 @@ fn run() -> Result<()> {
         Cmd::List => cmd_list(args.db),
         Cmd::Rm { name } => cmd_rm(args.db, &name),
         Cmd::Diff(a) => cmd_diff(args.db, a),
+        Cmd::Config(sub) => cmd_config(sub),
     }
 }
 
@@ -108,20 +110,31 @@ fn cmd_scan(db: Option<PathBuf>, a: ScanArgs) -> Result<()> {
         vols.iter().map(|v| v.label()).collect::<Vec<_>>().join(", ")
     );
 
-    // Build glob set for exclusions.
-    let exclude = {
+    // Build glob set for exclusions (from CLI --exclude only; config globs are
+    // handled by config::compile below).
+    let exclude_globset = {
         let mut b = GlobSetBuilder::new();
         for pat in &a.exclude {
             b.add(Glob::new(pat).with_context(|| format!("bad glob: {pat}"))?);
         }
         b.build()?
     };
-    let mut exclude_prefixes: Vec<String> = a
-        .exclude_path
-        .iter()
-        .map(|p| ScanOptions::normalize_prefix(p))
-        .filter(|p| !p.is_empty())
-        .collect();
+
+    // Merge persistent config + per-run CLI exclusions into one compiled set.
+    let cfg = if a.no_config {
+        config::Config::default()
+    } else {
+        match config::load_or_default() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[warn] config load failed: {e:#} — continuing without it");
+                config::Config::default()
+            }
+        }
+    };
+    let compiled = config::compile(&cfg, &a.exclude_path, &[], &a.exclude_regex)?;
+    let mut exclude_prefixes: Vec<String> = compiled.prefix_vec();
+    let exclude_regexes = compiled.regexes.clone();
 
     // Always exclude fdiff's own DB directory from scans — otherwise every
     // snapshot picks up the live SQLite WAL it just wrote.
@@ -142,16 +155,16 @@ fn cmd_scan(db: Option<PathBuf>, a: ScanArgs) -> Result<()> {
     exclude_prefixes.sort();
     exclude_prefixes.dedup();
 
-    if !exclude_prefixes.is_empty() {
-        println!(
-            "Excluding {} path prefix(es): {}",
-            exclude_prefixes.len(),
-            exclude_prefixes.join(", ")
-        );
+    if !compiled.display.is_empty() {
+        println!("Applying {} exclusion rule(s):", compiled.display.len());
+        for line in &compiled.display {
+            println!("  - {line}");
+        }
     }
     let opts = ScanOptions {
-        exclude,
+        exclude: exclude_globset,
         exclude_prefixes,
+        exclude_regexes,
     };
 
     // Set up channel and writer thread.
@@ -265,18 +278,30 @@ fn cmd_diff(db: Option<PathBuf>, a: DiffArgs) -> Result<()> {
     ext_filter.sort();
     ext_filter.dedup();
 
-    // ---- Path-prefix exclusions ----
-    let mut exclude_prefixes: Vec<String> = a
-        .exclude_path
-        .iter()
-        .map(|p| mft::ScanOptions::normalize_prefix(p))
-        .filter(|p| !p.is_empty())
-        .collect();
+    // ---- Path / glob / regex exclusions (config + CLI) ----
+    let cfg = if a.no_config {
+        config::Config::default()
+    } else {
+        match config::load_or_default() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[warn] config load failed: {e:#} — continuing without it");
+                config::Config::default()
+            }
+        }
+    };
+    let compiled = config::compile(
+        &cfg,
+        &a.exclude_path,
+        &a.exclude,
+        &a.exclude_regex,
+    )?;
+    let mut exclude_prefixes: Vec<String> = compiled.prefix_vec();
+    let exclude_regexes = compiled.regexes.clone();
+    let exclude_globs = compiled.globs.clone();
 
     if !a.include_self {
-        // Always hide fdiff's DB directory unless the user opted in. We add both
-        // the resolved DB's parent directory and the standard %LOCALAPPDATA%
-        // location, so a custom --db path is also covered.
+        // Always hide fdiff's DB directory unless the user opted in.
         if let Some(parent) = resolved_db.parent() {
             let p = mft::ScanOptions::normalize_prefix(&parent.to_string_lossy());
             if !p.is_empty() {
@@ -291,9 +316,6 @@ fn cmd_diff(db: Option<PathBuf>, a: DiffArgs) -> Result<()> {
                 }
             }
         }
-        // If --dump is in use, the dump directory itself isn't part of the
-        // snapshot (it doesn't exist until after the diff runs), but if the
-        // user reuses a path it might be. Hide it pre-emptively.
         if let Some(out) = a.dump.as_ref() {
             let p = mft::ScanOptions::normalize_prefix(&out.to_string_lossy());
             if !p.is_empty() {
@@ -310,12 +332,11 @@ fn cmd_diff(db: Option<PathBuf>, a: DiffArgs) -> Result<()> {
             ext_filter.join(", .")
         );
     }
-    if !exclude_prefixes.is_empty() {
-        println!(
-            "Hiding {} path prefix(es) from diff: {}",
-            exclude_prefixes.len(),
-            exclude_prefixes.join(", ")
-        );
+    if !compiled.display.is_empty() {
+        println!("Hiding {} rule(s) in diff:", compiled.display.len());
+        for line in &compiled.display {
+            println!("  - {line}");
+        }
     }
 
     let opts = diff::DiffOptions {
@@ -323,6 +344,8 @@ fn cmd_diff(db: Option<PathBuf>, a: DiffArgs) -> Result<()> {
         limit_per_category: a.limit,
         ext_filter,
         exclude_prefixes,
+        exclude_regexes,
+        exclude_globs,
     };
     let t0 = std::time::Instant::now();
     let rep = diff::diff(&conn, &a.before, &a.after, &opts)?;
@@ -363,13 +386,28 @@ fn cmd_watch(db: Option<PathBuf>, a: WatchArgs) -> Result<()> {
     ext_filter.sort();
     ext_filter.dedup();
 
-    // Path exclusions + auto-hide fdiff's own DB folder + dump folder.
-    let mut exclude_prefixes: Vec<String> = a
-        .exclude_path
-        .iter()
-        .map(|p| watch::normalize_prefix(p))
-        .filter(|p| !p.is_empty())
-        .collect();
+    // Path / glob / regex exclusions (config + CLI).
+    let cfg = if a.no_config {
+        config::Config::default()
+    } else {
+        match config::load_or_default() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[warn] config load failed: {e:#} — continuing without it");
+                config::Config::default()
+            }
+        }
+    };
+    let compiled = config::compile(
+        &cfg,
+        &a.exclude_path,
+        &[],
+        &a.exclude_regex,
+    )?;
+    let mut exclude_prefixes: Vec<String> = compiled.prefix_vec();
+    let exclude_regexes = compiled.regexes.clone();
+    let exclude_globs = compiled.globs.clone();
+
     if !a.include_self {
         let db_p = db_path(db.clone())?;
         if let Some(parent) = db_p.parent() {
@@ -396,13 +434,77 @@ fn cmd_watch(db: Option<PathBuf>, a: WatchArgs) -> Result<()> {
         exclude_prefixes.dedup();
     }
 
+    if !compiled.display.is_empty() {
+        eprintln!("Hiding {} rule(s):", compiled.display.len());
+        for line in &compiled.display {
+            eprintln!("  - {line}");
+        }
+    }
+
     let opts = watch::WatchOptions {
         volumes: a.volumes,
         ext_filter,
         exclude_prefixes,
+        exclude_regexes,
+        exclude_globs,
         dump_dir: a.dump,
         json: a.json,
         no_close_events: false,
     };
     watch::run_watch(opts)
+}
+
+fn cmd_config(sub: ConfigCmd) -> Result<()> {
+    match sub {
+        ConfigCmd::Show => {
+            let cfg = config::load_or_default()?;
+            config::show(&cfg);
+            Ok(())
+        }
+        ConfigCmd::Path => {
+            println!("{}", config::config_path_for_display());
+            Ok(())
+        }
+        ConfigCmd::Reset => {
+            let (p, cfg) = config::reset_to_defaults()?;
+            println!("Reset config to defaults at {}", p.display());
+            config::show(&cfg);
+            Ok(())
+        }
+        ConfigCmd::Add { pattern, kind } => {
+            let kind = match kind.to_ascii_lowercase().as_str() {
+                "prefix" => config::RuleKind::Prefix,
+                "glob" => config::RuleKind::Glob,
+                "regex" | "re" => config::RuleKind::Regex,
+                other => anyhow::bail!("unknown kind '{other}', must be prefix|glob|regex"),
+            };
+            let mut cfg = config::load_or_default()?;
+            // Pre-validate compilation so the user finds out now, not later.
+            let _ = config::compile(
+                &config::Config {
+                    exclude_paths: vec![config::ExcludeRule {
+                        kind,
+                        pattern: pattern.clone(),
+                    }],
+                },
+                &[],
+                &[],
+                &[],
+            )?;
+            config::add_rule(&mut cfg, config::ExcludeRule { kind, pattern: pattern.clone() });
+            let p = config::save(&cfg)?;
+            println!("Added [{:?}] {} to {}", kind, pattern, p.display());
+            Ok(())
+        }
+        ConfigCmd::Rm { key } => {
+            let mut cfg = config::load_or_default()?;
+            let n = config::remove_rule(&mut cfg, &key)?;
+            if n == 0 {
+                anyhow::bail!("no rule matched '{key}' (try `fdiff config show` for indices)");
+            }
+            let p = config::save(&cfg)?;
+            println!("Removed {n} rule(s); updated {}", p.display());
+            Ok(())
+        }
+    }
 }
