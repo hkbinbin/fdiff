@@ -22,8 +22,8 @@ a few seconds, monitoring is push-based (zero polling).
   anything with the `MZ` magic; skips bulk data.
 * **`--dump <dir>`** — auto-collect every changed PE into a triage folder
   alongside a `manifest.json` / `watch_manifest.jsonl`.
-* **Persistent exclusion config** — save your `--exclude-path` /
-  `--exclude-regex` rules once; reused by every subsequent run.
+* **Persistent exclusion config** — save prefix / regex rules once with
+  `fdiff config`; reused by every subsequent run.
 * **Single static binary, no install** — ~4 MB, embeds an
   `requireAdministrator` manifest.
 
@@ -99,13 +99,9 @@ Default DB: `%LOCALAPPDATA%\fdiff\fdiff.db`. Override anywhere with `--db <path>
 fdiff scan <name>
 fdiff scan <name> --volumes C,D              # whitelist drive letters
 fdiff scan <name> --exclude-volumes D,E      # blacklist drive letters
-fdiff scan <name> --exclude-path "<prefix>"  # prefix exclusion (repeatable)
-fdiff scan <name> --exclude '<glob>'         # glob exclusion (repeatable)
-fdiff scan <name> --exclude-regex '<regex>'  # regex exclusion (repeatable)
 fdiff scan <name> --no-hash                  # skip the SHA-256 pass (fastest)
 fdiff scan <name> --blake3                   # also compute BLAKE3
 fdiff scan <name> --note "before cheat"      # free-form note
-fdiff scan <name> --no-config                # ignore saved exclusion rules
 ```
 
 ### `diff`
@@ -114,15 +110,11 @@ fdiff scan <name> --no-config                # ignore saved exclusion rules
 fdiff diff <before> <after>
 fdiff diff <before> <after> --ext exe,dll,sys     # only show these extensions
 fdiff diff <before> <after> --ext pe              # shortcut for full PE set
-fdiff diff <before> <after> --exclude-path <pfx>  # one-shot prefix hide
-fdiff diff <before> <after> --exclude-regex <re>  # one-shot regex hide
-fdiff diff <before> <after> --exclude <glob>      # one-shot glob hide
 fdiff diff <before> <after> --include-dirs        # also report directory changes (noisy)
 fdiff diff <before> <after> --include-self        # don't auto-hide fdiff's own DB folder
 fdiff diff <before> <after> --limit 200           # cap each category (fast triage)
 fdiff diff <before> <after> --json                # machine-readable
 fdiff diff <before> <after> --dump triage\        # console + copy PEs + manifest.json
-fdiff diff <before> <after> --no-config           # ignore saved exclusion rules
 ```
 
 `diff` reports five kinds of change:
@@ -140,11 +132,8 @@ fdiff diff <before> <after> --no-config           # ignore saved exclusion rules
 fdiff watch                              # monitor every NTFS volume
 fdiff watch --volumes C                  # just the system drive
 fdiff watch --ext pe --dump live\        # only PE files, auto-collect to live\
-fdiff watch --exclude-path <pfx>
-fdiff watch --exclude-regex <re>
 fdiff watch --json | jq -c '.'           # JSONL stream
 fdiff watch --include-self               # don't auto-hide fdiff's own DB folder
-fdiff watch --no-config                  # ignore saved exclusion rules
 ```
 
 Text-mode output:
@@ -182,13 +171,9 @@ Caveats:
 |---|---|---|
 | `--volumes C,D`           | `scan`               | drive-letter whitelist |
 | `--exclude-volumes D,E`   | `scan`               | drive-letter blacklist |
-| `--exclude-path "<pfx>"`  | `scan` / `diff` / `watch` | path prefix at component boundary, case-insensitive |
-| `--exclude '<glob>'`      | `scan` / `diff`      | full-path glob (globset) |
-| `--exclude-regex '<re>'`  | `scan` / `diff` / `watch` | full-path regex, case-insensitive by default |
 | `--ext exe,dll,sys`       | `diff` / `watch`     | only these extensions (`--ext pe` expands to the full PE set) |
 | `--include-dirs`          | `diff`               | also report directory entries |
 | `--include-self`          | `diff` / `watch`     | don't auto-hide `%LOCALAPPDATA%\fdiff` |
-| `--no-config`             | `scan` / `diff` / `watch` | ignore saved rules in `config.json` for this run |
 
 ### Auto-hide of fdiff's own files
 
@@ -201,30 +186,29 @@ the diff would be full of self-noise. Pass `--include-self` to see them.
 
 ## Persistent exclusion config (`fdiff config`)
 
-Tired of typing the same `--exclude-path` every time? Save your rules once:
+Save noisy paths once; `scan`, `diff`, and `watch` apply these rules automatically:
 
 ```cmd
 fdiff config show                                          :: list current rules
 fdiff config path                                          :: print config file location
 fdiff config add "C:\Users\me\AppData\Local\Microsoft\Edge"
-fdiff config add "**/$Recycle.Bin/**"            --kind glob
 fdiff config add ".*\\ContentDeliveryManager.*"  --kind regex
+fdiff config add "X:\Noise\.*"                   --kind regex
 fdiff config rm 2                                          :: remove rule #2
 fdiff config rm "C:\Users\me\AppData\Local\Microsoft\Edge"
 fdiff config reset                                         :: restore the shipped defaults
 ```
 
 Rules live in `%LOCALAPPDATA%\fdiff\config.json` and are auto-applied by every
-subsequent `scan`, `diff`, and `watch` run. Pass `--no-config` to disable for
-a single invocation.
+subsequent `scan`, `diff`, and `watch` run.
 
 ### Rule kinds
 
 | Kind     | Match | Example |
 |----------|-------|---------|
 | `prefix` *(default)* | full path starts with this string at a component boundary, case-insensitive | `C:\Users\me\AppData\Local\Microsoft\Edge` |
-| `glob`   | full-path glob (globset) | `${LOCALAPPDATA}\Packages\Microsoft.Windows.ContentDeliveryManager*` |
-| `regex`  | full-path regex (Rust regex flavor), case-insensitive by default — prepend `(?-i)` to override | `.*\\AppData\\Local\\Temp\\.*\.tmp$` |
+| `glob`   | full-path glob (globset, kept for existing configs) | `${LOCALAPPDATA}\Packages\Microsoft.Windows.ContentDeliveryManager*` |
+| `regex`  | full-path regex (Rust regex flavor), case-insensitive by default; prepend `(?-i)` to override. Plain Windows separators are accepted for path-style regexes. | `X:\Noise\.*` |
 
 ### Variables
 
@@ -236,7 +220,7 @@ runtime, so the same config works across machines and accounts:
   "exclude_paths": [
     { "kind": "prefix", "pattern": "${LOCALAPPDATA}\\Microsoft\\Edge" },
     { "kind": "prefix", "pattern": "${LOCALAPPDATA}\\Microsoft\\Windows" },
-    { "kind": "glob",   "pattern": "${LOCALAPPDATA}\\Packages\\Microsoft.Windows.ContentDeliveryManager*" }
+    { "kind": "regex",  "pattern": "^${LOCALAPPDATA}\\Packages\\Microsoft\\.Windows\\.ContentDeliveryManager" }
   ]
 }
 ```
@@ -248,7 +232,7 @@ noise:
 
 * `${LOCALAPPDATA}\Microsoft\Edge`                                            *(prefix)*
 * `${LOCALAPPDATA}\Microsoft\Windows`                                         *(prefix — WebCache etc.)*
-* `${LOCALAPPDATA}\Packages\Microsoft.Windows.ContentDeliveryManager*`        *(glob)*
+* `^${LOCALAPPDATA}\Packages\Microsoft\.Windows\.ContentDeliveryManager`      *(regex)*
 
 `fdiff config show` always prints the live set (including expanded paths).
 

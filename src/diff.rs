@@ -21,6 +21,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
+use crate::config;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum ChangeKind {
     Added,
@@ -172,8 +174,16 @@ pub fn diff(
           )
         {limit}
         "#,
-        dir_pred_b = if opts.include_dirs { "" } else { "AND b.is_dir = 0" },
-        dir_pred_a = if opts.include_dirs { "" } else { "AND a.is_dir = 0" },
+        dir_pred_b = if opts.include_dirs {
+            ""
+        } else {
+            "AND b.is_dir = 0"
+        },
+        dir_pred_a = if opts.include_dirs {
+            ""
+        } else {
+            "AND a.is_dir = 0"
+        },
         limit = limit_sql,
     );
 
@@ -236,7 +246,10 @@ pub fn diff(
     }
     drop(it);
     drop(stmt);
-    pb.set_message(format!("found {} modified / renamed", report.modified.len()));
+    pb.set_message(format!(
+        "found {} modified / renamed",
+        report.modified.len()
+    ));
 
     // -----------------------------------------------------------------------
     // 2) Added: NOT EXISTS in `before`. NOT EXISTS lets the planner do an
@@ -256,7 +269,11 @@ pub fn diff(
           )
         {limit}
         "#,
-        dir_pred = if opts.include_dirs { "" } else { "AND a.is_dir = 0" },
+        dir_pred = if opts.include_dirs {
+            ""
+        } else {
+            "AND a.is_dir = 0"
+        },
         limit = limit_sql,
     );
     let mut stmt = conn.prepare(&q_add)?;
@@ -296,7 +313,11 @@ pub fn diff(
           )
         {limit}
         "#,
-        dir_pred = if opts.include_dirs { "" } else { "AND b.is_dir = 0" },
+        dir_pred = if opts.include_dirs {
+            ""
+        } else {
+            "AND b.is_dir = 0"
+        },
         limit = limit_sql,
     );
     let mut stmt = conn.prepare(&q_rm)?;
@@ -339,8 +360,16 @@ pub fn diff(
           {dir_pred_a}
         {limit}
         "#,
-        dir_pred_b = if opts.include_dirs { "" } else { "AND b.is_dir = 0" },
-        dir_pred_a = if opts.include_dirs { "" } else { "AND a.is_dir = 0" },
+        dir_pred_b = if opts.include_dirs {
+            ""
+        } else {
+            "AND b.is_dir = 0"
+        },
+        dir_pred_a = if opts.include_dirs {
+            ""
+        } else {
+            "AND a.is_dir = 0"
+        },
         limit = limit_sql,
     );
     let mut stmt = conn.prepare(&q_repl)?;
@@ -429,7 +458,7 @@ fn path_keep(path: &str, opts: &DiffOptions) -> bool {
     if opts.exclude_globs.iter().any(|g| g.is_match(path)) {
         return false;
     }
-    if opts.exclude_regexes.iter().any(|r| r.is_match(path)) {
+    if config::regexes_match_path(&opts.exclude_regexes, path) {
         return false;
     }
     if !opts.ext_filter.is_empty() {

@@ -13,8 +13,11 @@
 //!   threads to stop polling and exit cleanly.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write as _};
+use std::mem::size_of;
+use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,9 +30,15 @@ use ntfs_reader::journal::{Journal, JournalOptions, NextUsn};
 use ntfs_reader::volume::Volume;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use windows::core::PCSTR;
+use windows::Win32::{
+    Foundation,
+    Storage::FileSystem,
+    System::{Ioctl, IO},
+};
 
+use crate::config::CompiledRules;
 use crate::hasher::PE_EXTS;
-use crate::mft::ScanOptions;
 use crate::volume::{enumerate_ntfs_volumes, NtfsVolume};
 
 const REASON_FILE_CREATE: u32 = 0x0000_0100;
@@ -78,13 +87,17 @@ pub struct WatchEvent {
     pub size: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
+enum WatchMessage {
+    Event(WatchEvent),
+    ReaderError { volume: String, error: String },
+}
+
+#[derive(Default)]
 pub struct WatchOptions {
     pub volumes: Vec<String>,
     pub ext_filter: Vec<String>,
-    pub exclude_prefixes: Vec<String>,
-    pub exclude_regexes: Vec<regex::Regex>,
-    pub exclude_globs: Vec<globset::GlobMatcher>,
+    pub exclusions: CompiledRules,
     pub dump_dir: Option<PathBuf>,
     pub json: bool,
     #[allow(dead_code)]
@@ -98,7 +111,12 @@ pub fn run_watch(opts: WatchOptions) -> Result<()> {
         let wanted: Vec<String> = opts
             .volumes
             .iter()
-            .map(|v| v.trim().trim_end_matches('\\').trim_end_matches(':').to_uppercase())
+            .map(|v| {
+                v.trim()
+                    .trim_end_matches('\\')
+                    .trim_end_matches(':')
+                    .to_uppercase()
+            })
             .collect();
         vols.retain(|v| {
             let lab = v.label().to_uppercase();
@@ -112,18 +130,17 @@ pub fn run_watch(opts: WatchOptions) -> Result<()> {
     }
     eprintln!(
         "fdiff watch on: {}",
-        vols.iter().map(|v| v.label()).collect::<Vec<_>>().join(", ")
+        vols.iter()
+            .map(|v| v.label())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     if !opts.ext_filter.is_empty() {
         eprintln!("  filter: .{}", opts.ext_filter.join(", ."));
     }
-    if !opts.exclude_prefixes.is_empty() {
-        eprintln!("  hidden prefixes: {}", opts.exclude_prefixes.join(", "));
-    }
     if let Some(dir) = &opts.dump_dir {
         eprintln!("  dump dir: {}", dir.display());
-        fs::create_dir_all(dir)
-            .with_context(|| format!("create dump dir {:?}", dir))?;
+        fs::create_dir_all(dir).with_context(|| format!("create dump dir {:?}", dir))?;
     }
     eprintln!("  press Ctrl-C to stop\n");
 
@@ -136,16 +153,25 @@ pub fn run_watch(opts: WatchOptions) -> Result<()> {
         .context("installing Ctrl-C handler")?;
     }
 
-    let (tx, rx) = bounded::<WatchEvent>(4096);
+    let (tx, rx) = bounded::<WatchMessage>(4096);
+    let reader_count = vols.len();
 
     // Spawn one reader per volume.
     let mut handles = Vec::new();
     for v in vols {
+        let label = v.label();
         let txc = tx.clone();
         let rc = running.clone();
         let handle = thread::Builder::new()
-            .name(format!("fdiff-watch-{}", v.label()))
-            .spawn(move || -> Result<()> { reader_loop(v, txc, rc) })?;
+            .name(format!("fdiff-watch-{label}"))
+            .spawn(move || {
+                if let Err(e) = reader_loop(v, txc.clone(), rc) {
+                    let _ = txc.send(WatchMessage::ReaderError {
+                        volume: label,
+                        error: format!("{e:#}"),
+                    });
+                }
+            })?;
         handles.push(handle);
     }
     drop(tx); // we only hold receiver in this thread now
@@ -162,29 +188,19 @@ pub fn run_watch(opts: WatchOptions) -> Result<()> {
     } else {
         None
     };
+    let mut reader_errors = Vec::new();
 
     // Drain channel until all readers exit OR ctrl-c.
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(mut ev) => {
-                // Filter: ext / exclude path / globs / regexes.
-                if !opts.exclude_prefixes.is_empty() {
-                    let lower = ev.path.to_ascii_lowercase();
-                    if opts.exclude_prefixes.iter().any(|p| starts_with(&lower, p)) {
-                        continue;
-                    }
-                }
-                if opts.exclude_globs.iter().any(|g| g.is_match(&ev.path)) {
+            Ok(WatchMessage::ReaderError { volume, error }) => {
+                let line = format!("[{volume}] reader failed: {error}");
+                eprintln!("{line}");
+                reader_errors.push(line);
+            }
+            Ok(WatchMessage::Event(mut ev)) => {
+                if !should_emit_event(&ev, &opts) {
                     continue;
-                }
-                if opts.exclude_regexes.iter().any(|r| r.is_match(&ev.path)) {
-                    continue;
-                }
-                if !opts.ext_filter.is_empty() {
-                    let ext = ext_of(&ev.path);
-                    if !opts.ext_filter.iter().any(|e| e == &ext) {
-                        continue;
-                    }
                 }
 
                 // Dedup very quick repeats.
@@ -200,7 +216,10 @@ pub fn run_watch(opts: WatchOptions) -> Result<()> {
                 // Optional: hash + copy to dump dir (only for Created / Modified,
                 // and only PE-looking files we can still read).
                 if let Some(dir) = &opts.dump_dir {
-                    if matches!(ev.kind, EventKind::Created | EventKind::Modified | EventKind::Renamed) {
+                    if matches!(
+                        ev.kind,
+                        EventKind::Created | EventKind::Modified | EventKind::Renamed
+                    ) {
                         let _ = hash_and_dump(&mut ev, dir, manifest_file.as_mut());
                     }
                 }
@@ -218,17 +237,21 @@ pub fn run_watch(opts: WatchOptions) -> Result<()> {
 
     // Wait for readers; they poll `running` every cycle.
     for h in handles {
-        let _ = h.join();
+        if h.join().is_err() {
+            reader_errors.push("reader thread panicked".to_string());
+        }
+    }
+    if running.load(Ordering::SeqCst)
+        && !reader_errors.is_empty()
+        && reader_errors.len() >= reader_count
+    {
+        anyhow::bail!("all watch readers failed");
     }
     eprintln!("\nfdiff watch: stopped.");
     Ok(())
 }
 
-fn reader_loop(
-    vol: NtfsVolume,
-    tx: Sender<WatchEvent>,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
+fn reader_loop(vol: NtfsVolume, tx: Sender<WatchMessage>, running: Arc<AtomicBool>) -> Result<()> {
     // Open as Volume. For the journal we want the \\?\ form per the lib example.
     let path = match vol.mount.as_ref() {
         Some(m) => {
@@ -241,20 +264,13 @@ fn reader_loop(
         }
         None => vol.guid_path.trim_end_matches('\\').to_string(),
     };
-    let volume = Volume::new(&path)
-        .with_context(|| format!("opening volume {path}"))?;
+    let volume = Volume::new(&path).with_context(|| format!("opening volume {path}"))?;
 
-    let mut journal = Journal::new(
-        volume,
-        JournalOptions {
-            // Start from current end-of-journal so we only see live events.
-            next_usn: NextUsn::Next,
-            ..Default::default()
-        },
-    )
-    .with_context(|| format!("opening USN journal of {path}"))?;
+    let mut journal = open_journal_or_create(&path, volume)
+        .with_context(|| format!("opening USN journal of {path}"))?;
 
     let label = vol.label();
+    let mount = vol.mount.clone();
     while running.load(Ordering::SeqCst) {
         let events = match journal.read() {
             Ok(v) => v,
@@ -281,7 +297,7 @@ fn reader_loop(
             let renamed_from = if kind == EventKind::Renamed {
                 journal
                     .match_rename(&rec)
-                    .map(|p| p.to_string_lossy().to_string())
+                    .map(|p| format_record_path(&p, mount.as_deref()))
             } else if rec.reason & REASON_RENAME_OLD_NAME != 0 {
                 // Drop the OLD half — we'll emit the NEW half instead.
                 continue;
@@ -293,17 +309,158 @@ fn reader_loop(
                 timestamp: chrono::Utc::now().timestamp(),
                 volume: label.clone(),
                 kind,
-                path: rec.path.to_string_lossy().to_string(),
+                path: format_record_path(&rec.path, mount.as_deref()),
                 renamed_from,
                 sha256_hex: None,
                 size: None,
             };
-            if tx.send(ev).is_err() {
+            if tx.send(WatchMessage::Event(ev)).is_err() {
                 return Ok(()); // receiver gone
             }
         }
     }
     Ok(())
+}
+
+fn should_emit_event(ev: &WatchEvent, opts: &WatchOptions) -> bool {
+    if opts.exclusions.excludes(&ev.path) {
+        return false;
+    }
+    if !opts.ext_filter.is_empty() {
+        let ext = ext_of(&ev.path);
+        if !opts.ext_filter.iter().any(|e| e == &ext) {
+            return false;
+        }
+    }
+    true
+}
+
+fn open_journal_or_create(path: &str, volume: Volume) -> Result<Journal> {
+    let options = JournalOptions {
+        // Start from current end-of-journal so we only see live events.
+        next_usn: NextUsn::Next,
+        ..Default::default()
+    };
+
+    match Journal::new(volume, options.clone()) {
+        Ok(journal) => Ok(journal),
+        Err(first_err) => {
+            create_usn_journal(path).with_context(|| {
+                format!(
+                    "USN journal was not usable and creating it failed; original open error: {first_err:#}"
+                )
+            })?;
+            let volume = Volume::new(path)
+                .with_context(|| format!("reopening volume {path} after creating USN journal"))?;
+            Journal::new(volume, options)
+                .with_context(|| format!("opening newly-created USN journal of {path}"))
+        }
+    }
+}
+
+fn create_usn_journal(path: &str) -> Result<()> {
+    const DEFAULT_USN_MAX_SIZE: u64 = 32 * 1024 * 1024;
+    const DEFAULT_USN_ALLOCATION_DELTA: u64 = 4 * 1024 * 1024;
+
+    let c_path = CString::new(path).context("volume path contains an interior NUL byte")?;
+    unsafe {
+        let handle = FileSystem::CreateFileA(
+            PCSTR::from_raw(c_path.as_bytes_with_nul().as_ptr()),
+            (FileSystem::FILE_GENERIC_READ | FileSystem::FILE_GENERIC_WRITE).0,
+            FileSystem::FILE_SHARE_READ
+                | FileSystem::FILE_SHARE_WRITE
+                | FileSystem::FILE_SHARE_DELETE,
+            None,
+            FileSystem::OPEN_EXISTING,
+            FileSystem::FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        .with_context(|| format!("opening volume {path} to create USN journal"))?;
+
+        let data = Ioctl::CREATE_USN_JOURNAL_DATA {
+            MaximumSize: DEFAULT_USN_MAX_SIZE,
+            AllocationDelta: DEFAULT_USN_ALLOCATION_DELTA,
+        };
+        let mut bytes_returned = 0u32;
+        let result = IO::DeviceIoControl(
+            handle,
+            Ioctl::FSCTL_CREATE_USN_JOURNAL,
+            Some(&data as *const _ as *const c_void),
+            size_of::<Ioctl::CREATE_USN_JOURNAL_DATA>() as u32,
+            None,
+            0,
+            Some(&mut bytes_returned),
+            None,
+        );
+        let _ = Foundation::CloseHandle(handle);
+        result.with_context(|| format!("FSCTL_CREATE_USN_JOURNAL on {path}"))?;
+    }
+
+    Ok(())
+}
+
+fn format_record_path(path: &Path, mount: Option<&str>) -> String {
+    let s = path.to_string_lossy().to_string();
+
+    if let Some(label) = mount.and_then(drive_label_from_mount) {
+        let extended = format!("\\\\?\\{label}");
+        if let Some(rest) = strip_prefix_ignore_ascii_case(&s, &extended) {
+            return format!("{label}{rest}");
+        }
+
+        let device = format!("\\\\.\\{label}");
+        if let Some(rest) = strip_prefix_ignore_ascii_case(&s, &device) {
+            return format!("{label}{rest}");
+        }
+
+        if !is_windows_qualified_path(&s) {
+            if s.starts_with('\\') || s.starts_with('/') {
+                return format!("{label}{s}");
+            }
+            return format!("{label}\\{s}");
+        }
+    }
+
+    if let Some(stripped) = strip_drive_extended_prefix(&s) {
+        return stripped;
+    }
+
+    s
+}
+
+fn drive_label_from_mount(mount: &str) -> Option<String> {
+    let label = mount.trim_end_matches('\\').trim_end_matches('/');
+    let bytes = label.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        Some(label.to_string())
+    } else {
+        None
+    }
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+fn strip_drive_extended_prefix(s: &str) -> Option<String> {
+    let rest = strip_prefix_ignore_ascii_case(s, "\\\\?\\")?;
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        Some(rest.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_windows_qualified_path(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || s.starts_with("\\\\")
+        || s.starts_with("//")
 }
 
 fn classify(reason: u32) -> Option<EventKind> {
@@ -473,17 +630,6 @@ fn ext_of(path: &str) -> String {
     }
 }
 
-fn starts_with(lower_path: &str, prefix: &str) -> bool {
-    if !lower_path.starts_with(prefix) {
-        return false;
-    }
-    match lower_path.as_bytes().get(prefix.len()) {
-        None => true,
-        Some(b'\\') | Some(b'/') => true,
-        _ => false,
-    }
-}
-
 fn pe_like(path: &str) -> bool {
     let ext = ext_of(path);
     if PE_EXTS.iter().any(|e| *e == ext) {
@@ -499,8 +645,51 @@ fn pe_like(path: &str) -> bool {
     false
 }
 
-/// Re-export so main can use ScanOptions::normalize_prefix without depending on
-/// the mft module path from cli.rs.
-pub fn normalize_prefix(p: &str) -> String {
-    ScanOptions::normalize_prefix(p)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_extended_drive_paths_for_mount() {
+        assert_eq!(
+            format_record_path(Path::new(r"\\?\X:\dir\file.txt"), Some("X:\\")),
+            r"X:\dir\file.txt"
+        );
+    }
+
+    #[test]
+    fn prefixes_rooted_paths_with_mount() {
+        assert_eq!(
+            format_record_path(Path::new(r"\dir\file.txt"), Some("X:\\")),
+            r"X:\dir\file.txt"
+        );
+    }
+
+    #[test]
+    fn keeps_guid_paths_extended() {
+        let path = r"\\?\Volume{f083cf4e-4827-4258-9e8b-80073c25a5c5}\dir\file.txt";
+        assert_eq!(format_record_path(Path::new(path), None), path);
+    }
+
+    #[test]
+    fn config_regex_exclusions_suppress_watch_events() {
+        let cfg = crate::config::Config {
+            exclude_paths: vec![crate::config::ExcludeRule::regex(r"X:\Noise\.*")],
+        };
+        let opts = WatchOptions {
+            exclusions: crate::config::compile(&cfg).unwrap(),
+            ..Default::default()
+        };
+        let ev = WatchEvent {
+            timestamp: 0,
+            volume: "X:".to_string(),
+            kind: EventKind::Created,
+            path: r"X:\Noise\file.tmp".to_string(),
+            renamed_from: None,
+            sha256_hex: None,
+            size: None,
+        };
+
+        assert!(!should_emit_event(&ev, &opts));
+    }
 }

@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
     name = "fdiff",
     version,
     about = "Everything-style full-disk snapshot + diff for forensic triage \
-             (cheat / DLL hijack detection)",
+             (cheat / DLL hijack detection)"
 )]
 pub struct Cli {
     /// Override DB path (defaults to %LOCALAPPDATA%\fdiff\fdiff.db).
@@ -73,19 +73,6 @@ pub struct WatchArgs {
     #[arg(long, value_delimiter = ',')]
     pub ext: Vec<String>,
 
-    /// Skip files whose path starts with this prefix (case-insensitive, repeatable).
-    #[arg(long, value_name = "PATH")]
-    pub exclude_path: Vec<String>,
-
-    /// Regex pattern(s) to exclude (matched against full path, case-insensitive
-    /// by default). Repeatable.
-    #[arg(long, value_name = "REGEX")]
-    pub exclude_regex: Vec<String>,
-
-    /// Ignore the saved config at %LOCALAPPDATA%\fdiff\config.json for this run.
-    #[arg(long)]
-    pub no_config: bool,
-
     /// Copy every Created/Modified/Renamed PE file to this directory and
     /// append entries to `watch_manifest.jsonl` in there.
     #[arg(long)]
@@ -114,26 +101,6 @@ pub struct ScanArgs {
     /// Applied after --volumes if both are present.
     #[arg(long, value_delimiter = ',')]
     pub exclude_volumes: Vec<String>,
-
-    /// Skip files whose path starts with this prefix (case-insensitive).
-    /// Repeatable. Example: `--exclude-path "C:\Windows\WinSxS"`.
-    /// Slashes and trailing backslashes are normalized for you.
-    #[arg(long, value_name = "PATH")]
-    pub exclude_path: Vec<String>,
-
-    /// Glob pattern(s) to exclude (matched against full path).
-    /// Repeatable. Example: `--exclude '**/$Recycle.Bin/**'`.
-    #[arg(long)]
-    pub exclude: Vec<String>,
-
-    /// Regex pattern(s) to exclude (matched against full path, case-insensitive
-    /// by default). Repeatable.
-    #[arg(long, value_name = "REGEX")]
-    pub exclude_regex: Vec<String>,
-
-    /// Ignore the saved config at %LOCALAPPDATA%\fdiff\config.json for this run.
-    #[arg(long)]
-    pub no_config: bool,
 
     /// Skip the hash stage entirely (much faster).
     #[arg(long)]
@@ -172,24 +139,6 @@ pub struct DiffArgs {
     /// (exe, dll, sys, scr, cpl, ocx, drv, efi, pyd, com).
     #[arg(long, value_delimiter = ',')]
     pub ext: Vec<String>,
-
-    /// Skip files whose path starts with this prefix (case-insensitive,
-    /// repeatable). Same matching rules as `scan --exclude-path`.
-    #[arg(long, value_name = "PATH")]
-    pub exclude_path: Vec<String>,
-
-    /// Regex pattern(s) to exclude (matched against full path, case-insensitive
-    /// by default). Repeatable.
-    #[arg(long, value_name = "REGEX")]
-    pub exclude_regex: Vec<String>,
-
-    /// Glob pattern(s) to exclude (matched against full path).
-    #[arg(long)]
-    pub exclude: Vec<String>,
-
-    /// Ignore the saved config at %LOCALAPPDATA%\fdiff\config.json for this run.
-    #[arg(long)]
-    pub no_config: bool,
 
     /// Don't auto-skip fdiff's own database / dump directories. By default
     /// %LOCALAPPDATA%\fdiff and the path passed to --dump are hidden, since

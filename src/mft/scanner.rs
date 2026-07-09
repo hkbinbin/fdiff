@@ -10,6 +10,7 @@ use ntfs_reader::file_info::{FileInfo, VecCache};
 use ntfs_reader::mft::Mft;
 use ntfs_reader::volume::Volume;
 
+use crate::config;
 use crate::volume::NtfsVolume;
 
 /// One filesystem record we persist per row.
@@ -31,7 +32,6 @@ pub struct FileRecord {
 }
 
 pub struct ScanOptions {
-    pub exclude: globset::GlobSet,
     /// Lowercased path prefixes; any file whose lowercased path starts with
     /// one of these is skipped. Paths are normalized to use backslashes and
     /// have no trailing separator.
@@ -39,6 +39,8 @@ pub struct ScanOptions {
     /// Compiled regexes to match against full path. Pre-compiled so the hot
     /// loop just does `re.is_match(path)`.
     pub exclude_regexes: Vec<regex::Regex>,
+    /// Compiled globs to match against full path.
+    pub exclude_globs: Vec<globset::GlobMatcher>,
 }
 
 impl ScanOptions {
@@ -61,8 +63,7 @@ pub fn scan_volume(
     tx: &Sender<FileRecord>,
 ) -> Result<ScanStats> {
     let open_path = vol.open_path();
-    let volume = Volume::new(&open_path)
-        .with_context(|| format!("opening volume {open_path}"))?;
+    let volume = Volume::new(&open_path).with_context(|| format!("opening volume {open_path}"))?;
     let mft = Mft::new(volume).with_context(|| format!("loading MFT of {open_path}"))?;
 
     let mut cache = VecCache::default();
@@ -101,15 +102,13 @@ pub fn scan_volume(
         }
 
         // 2) Glob filter.
-        if !opts.exclude.is_empty() && opts.exclude.is_match(&path_str) {
+        if opts.exclude_globs.iter().any(|g| g.is_match(&path_str)) {
             skipped += 1;
             continue;
         }
 
         // 3) Regex filter.
-        if !opts.exclude_regexes.is_empty()
-            && opts.exclude_regexes.iter().any(|r| r.is_match(&path_str))
-        {
+        if config::regexes_match_path(&opts.exclude_regexes, &path_str) {
             skipped += 1;
             continue;
         }
